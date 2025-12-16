@@ -1,0 +1,11 @@
+__pycache__/
+.pytest_cache/
+data/
+results/
+*.pkl
+*.pt
+*.h5
+*.h5ad
+*.ckpt
+*.log
+.DS_Store
