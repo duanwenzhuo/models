@@ -25,13 +25,30 @@ from tools import (
     compute_metric_raw,
 )
 from openai import OpenAI
-client = OpenAI(
-    api_key="sk-L1TUuj5pxxyBbg1aNiM2t5fQGdbhAOmJtgVufoXiek3KZLnJ",  
-    base_url="https://api.lmtgpt.top/v1"  
-)
+
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def build_openai_client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY") or config.OPENAI_API_KEY
+    base_url = os.getenv("OPENAI_BASE_URL") or config.OPENAI_BASE_URL
+
+    if not api_key:
+        logger.error(
+            "OpenAI API key is missing. Set OPENAI_API_KEY in the environment or config.OPENAI_API_KEY."
+        )
+        raise ValueError("OpenAI API key is required to initialize the client.")
+
+    client_kwargs = {"api_key": api_key}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+
+    return OpenAI(**client_kwargs)
+
+
+client = build_openai_client()
 
 # Integration method normalization helpers
 ALLOWED_INTEGRATION_METHODS = {"scvi", "harmony", "mnn", "cca", "liger"}
