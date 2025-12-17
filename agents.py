@@ -10,14 +10,20 @@ import pandas as pd
 import scanpy as sc
 import scipy.sparse as sp
 from anndata import AnnData
-from sklearn.metrics import silhouette_score
 
 # from langchain_openai import ChatOpenAI
 # from langchain.prompts import ChatPromptTemplate
 # from langchain_core.output_parsers import JsonOutputParser
 
 import config
-from tools import OmicsTools, INTEGRATION_METHODS, calculate_graph_connectivity
+from tools import (
+    OmicsTools,
+    INTEGRATION_METHODS,
+    METRIC_SPECS,
+    calculate_graph_connectivity,
+    compute_metric_raw,
+    normalize_metric_value,
+)
 from openai import OpenAI
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -979,67 +985,85 @@ class EvaluationAgent(BaseAgent):
     def __init__(self):
         super().__init__("Evaluator")
 
-    def _compute_batch_asw(self, embedding: np.ndarray, labels: pd.Series) -> Optional[float]:
-        unique_labels = labels.dropna().unique()
-        if len(unique_labels) < 2 or embedding.shape[0] <= len(unique_labels):
-            return None
-        try:
-            return float(silhouette_score(embedding, labels))
-        except Exception as e:
-            logger.warning(f"Batch ASW failed: {e}")
-            return None
-
-    def _compute_celltype_asw(self, embedding: np.ndarray, labels: pd.Series) -> Optional[float]:
-        unique_labels = labels.dropna().unique()
-        if len(unique_labels) < 2 or embedding.shape[0] <= len(unique_labels):
-            return None
-        try:
-            return float(silhouette_score(embedding, labels))
-        except Exception as e:
-            logger.warning(f"Celltype ASW failed: {e}")
-            return None
-
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
         results = state.get("results") or {}
+        plan = state.get("plan") or {}
+        inspection = state.get("inspection") or {}
+        adata_unintegrated_all = state.get("data_raw") or {}
         records = []
 
+        def _detect_obs_key(adata_obj: AnnData, candidates: List[str]) -> Optional[str]:
+            for key in candidates:
+                if key in adata_obj.obs:
+                    return key
+            return None
+
+        implemented_metrics = [mid for mid, spec in METRIC_SPECS.items() if spec.get("implemented")]
         for modality, methods in results.items():
             if not methods:
                 continue
+            subplan = plan.get(modality, {})
+            insp = inspection.get(modality) or next(iter(inspection.values()), {})
+            batch_key = subplan.get("batch_key") or insp.get("batch_key_effective") or "batch"
+
+            # Heuristic celltype/cluster keys from available annotations
+            adata_example = next(iter(methods.values())) if methods else None
+            celltype_key = None
+            cluster_key = None
+            if isinstance(adata_example, AnnData):
+                celltype_key = _detect_obs_key(
+                    adata_example, ["celltype", "cell_type", "cell_type_label", "cell_type"]
+                )
+                cluster_key = _detect_obs_key(adata_example, ["leiden", "louvain", "cluster", "clusters"])
+
             for method_name, adata in methods.items():
                 embedding_key = f"X_{method_name}"
                 if embedding_key not in adata.obsm:
                     logger.warning(f"[Evaluation] Missing embedding {embedding_key} for {modality}-{method_name}, skip.")
                     continue
 
-                emb = adata.obsm[embedding_key]
-                # Graph connectivity (simple fallback)
-                try:
-                    gc_value = calculate_graph_connectivity(emb, n_neighbors=15, n_cells=emb.shape[0])
-                    records.append({"modality": modality, "method": method_name, "metric": "graph_connectivity", "value": gc_value})
-                except Exception as e:
-                    logger.warning(f"[Evaluation] Graph connectivity failed for {modality}-{method_name}: {e}")
+                adata_unintegrated = adata_unintegrated_all.get(modality)
+                for metric_id in implemented_metrics:
+                    raw_value = compute_metric_raw(
+                        metric_id,
+                        adata_integrated=adata,
+                        adata_unintegrated=adata_unintegrated,
+                        embedding_key=embedding_key,
+                        modality=modality,
+                        batch_key=batch_key,
+                        celltype_key=celltype_key,
+                        cluster_key=cluster_key,
+                    )
+                    norm_value = normalize_metric_value(metric_id, raw_value)
+                    records.append(
+                        {
+                            "modality": modality,
+                            "method": method_name,
+                            "metric": metric_id,
+                            "raw_value": raw_value,
+                            "normalized": norm_value,
+                            "weight": METRIC_SPECS.get(metric_id, {}).get("weight", 1.0),
+                        }
+                    )
 
-                # Batch ASW
-                if "batch" in adata.obs:
-                    batch_val = self._compute_batch_asw(emb, adata.obs["batch"])
-                    if batch_val is not None:
-                        records.append({"modality": modality, "method": method_name, "metric": "batch_asw", "value": batch_val})
-
-                # Celltype ASW
-                if "celltype" in adata.obs:
-                    ct_val = self._compute_celltype_asw(emb, adata.obs["celltype"])
-                    if ct_val is not None:
-                        records.append({"modality": modality, "method": method_name, "metric": "celltype_asw", "value": ct_val})
-
-        eval_df = pd.DataFrame(records, columns=["modality", "method", "metric", "value"])
+        eval_df = pd.DataFrame(
+            records,
+            columns=["modality", "method", "metric", "raw_value", "normalized", "weight"],
+        )
         state["evaluation"] = eval_df
 
         method_scores: Dict[str, Dict[str, float]] = {}
         best_methods: Dict[str, str] = {}
         if not eval_df.empty:
             for (modality, method), subdf in eval_df.groupby(["modality", "method"]):
-                method_scores.setdefault(modality, {})[method] = float(subdf["value"].mean())
+                weighted_scores = []
+                for _, row in subdf.iterrows():
+                    if pd.notna(row.get("normalized")):
+                        weighted_scores.append((float(row.get("normalized")), float(row.get("weight", 1.0))))
+                if weighted_scores:
+                    total_weight = sum(w for _, w in weighted_scores)
+                    score = sum(val * w for val, w in weighted_scores) / max(total_weight, 1e-9)
+                    method_scores.setdefault(modality, {})[method] = float(score)
             for modality, scores in method_scores.items():
                 if scores:
                     best_methods[modality] = max(scores, key=scores.get)
@@ -1092,12 +1116,16 @@ class ReporterAgent(BaseAgent):
         if eval_df is None or eval_df.empty:
             print("No evaluation metrics were computed.")
             return
-        for metric, subdf in eval_df.groupby("metric"):
-            best_val = subdf["value"].max()
-            print(f"\nMetric: {metric}")
-            for _, row in subdf.iterrows():
-                star = " *" if row["value"] == best_val else ""
-                print(f"  {row['modality']} - {row['method']}: {row['value']:.4f}{star}")
+        grouped = eval_df.groupby(["modality", "method"])
+        for (modality, method), subdf in grouped:
+            print(f"\n[{modality}] {method}")
+            for _, row in subdf.sort_values("metric").iterrows():
+                raw = row.get("raw_value")
+                norm = row.get("normalized")
+                weight = row.get("weight")
+                raw_str = "NA" if pd.isna(raw) else f"{raw:.4f}"
+                norm_str = "NA" if pd.isna(norm) else f"{norm:.4f}"
+                print(f"  {row['metric']}: raw={raw_str}, normalized={norm_str}, weight={weight}")
 
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
         print("\n===== OMICS INTEGRATION REPORT =====")
