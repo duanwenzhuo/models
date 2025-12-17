@@ -281,7 +281,7 @@ run_seurat_integration <- function(seurat_object_list, output_prefix, is_gene_ac
 
 dir.create(RESULTS_OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 message("开始 R 端整合流程 ...")
-__MAIN_CALLS__
+
 message("所有 R 整合流程完成。")
 """
 

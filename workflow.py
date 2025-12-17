@@ -1,10 +1,8 @@
-# workf
 import operator
 from typing import Annotated, TypedDict, Dict, Any, List, Optional
 
 from langgraph.graph import StateGraph, END
 
-# 导入 Agents
 from agents import (
     PlannerAgent,
     PreprocessAgent,
@@ -35,6 +33,8 @@ class AgentState(TypedDict):
     # 数据对象 (AnnData) - 注意：内存在节点间传递引用
     data_hvg: Optional[Any]
     data_raw: Optional[Any]
+    data_hvg_full: Optional[Any]
+    data_raw_full: Optional[Any]
 
     # 最终结果
     results: Dict[str, Any]
@@ -47,9 +47,16 @@ class AgentState(TypedDict):
     run_all_methods: bool
     method_candidates: Optional[List[str]]
     param_presets: Optional[Dict[str, Dict[str, Dict[str, Any]]]]
-    chosen_params: Optional[Dict[str, str]]
+    chosen_params: Optional[Dict[str, List[str]]]
     param_results: Optional[Dict[str, Any]]
     compute_budget: Optional[Dict[str, Any]]
+    param_search_results: Optional[List[Dict[str, Any]]]
+    best_params: Optional[Dict[str, Any]]
+    best_rank: Optional[Dict[str, Any]]
+    method_errors: Optional[Dict[str, Any]]
+    final_selection: Optional[Dict[str, Any]]
+    top1_only: bool
+    search_params: bool
 
     # 执行日志/消息历史 (可选)
     logs: Annotated[List[str], operator.add]
@@ -63,7 +70,7 @@ def inspection_node(state: AgentState) -> AgentState:
     """运行 Inspection Agent"""
     try:
         agent = InspectionAgent()
-        print("🔍 [Workflow] Entering Inspection Node")
+        print("[Workflow] Entering Inspection Node")
         new_state = agent.run(state)
         new_state["logs"] = state.get("logs", []) + ["Inspection finished."]
         return new_state
@@ -75,7 +82,7 @@ def planner_node(state: AgentState) -> AgentState:
     """运行 Planner Agent"""
     try:
         agent = PlannerAgent()
-        print("🔵 [Workflow] Entering Planner Node")
+        print("[Workflow] Entering Planner Node")
         new_state = agent.run(state)
         new_state["logs"] = state.get("logs", []) + ["Planner finished successfully."]
         return new_state
@@ -89,7 +96,7 @@ def tuning_node(state: AgentState) -> AgentState:
         return state
     try:
         agent = TuningAgent()
-        print("🧪 [Workflow] Entering Tuning Node")
+        print("[Workflow] Entering Tuning Node")
         new_state = agent.run(state)
         new_state["logs"] = state.get("logs", []) + ["Tuning finished."]
         return new_state
@@ -104,7 +111,7 @@ def preprocess_node(state: AgentState) -> AgentState:
 
     try:
         agent = PreprocessAgent()
-        print("🧬 [Workflow] Entering Preprocess Node")
+        print("[Workflow] Entering Preprocess Node")
         new_state = agent.run(state)
         new_state["logs"] = state.get("logs", []) + ["Preprocessing finished."]
         return new_state
@@ -119,7 +126,7 @@ def integration_node(state: AgentState) -> AgentState:
 
     try:
         agent = IntegrationAgent()
-        print("🧭 [Workflow] Entering Integration Node")
+        print("[Workflow] Entering Integration Node")
         new_state = agent.run(state)
         new_state["logs"] = state.get("logs", []) + ["Integration finished."]
         return new_state
@@ -129,7 +136,7 @@ def integration_node(state: AgentState) -> AgentState:
 
 def evaluation_node(state: AgentState):
     agent = EvaluationAgent()
-    print("🧮 [Workflow] Entering Evaluation Node")
+    print("[Workflow] Entering Evaluation Node")
     new_state = agent.run(state)
     new_state["logs"] = state.get("logs", []) + ["Evaluation finished."]
     return new_state
@@ -137,56 +144,52 @@ def evaluation_node(state: AgentState):
 
 def reporter_node(state: AgentState):
     agent = ReporterAgent()
-    print("📰 [Workflow] Entering Reporter Node")
+    print("[Workflow] Entering Reporter Node")
     new_state = agent.run(state)
     new_state["logs"] = state.get("logs", []) + ["Reporter finished."]
     return new_state
 
 
 # ==========================================
-# 3. 决策函数 (Routing)
+# 3. 路由函数 (Routing)
 # ==========================================
 def should_preprocess(state: AgentState) -> str:
-    """
-    根据 Planner 结果判断是否需要运行 Preprocess Agent。
-    """
+    """根据 Planner 结果判断是否需要运行 Preprocess Agent。"""
     plan = state.get("plan") or {}
     error = state.get("error")
 
     if error:
-        print("❌ [Router] Planner failed, proceeding to END.")
+        print("[Router] Planner failed, proceeding to END.")
         return END
 
     if not plan:
-        print("➡️ [Router] No plan found, defaulting to Preprocessor.")
+        print("[Router] No plan found, defaulting to Preprocessor.")
         return "preprocessor"
 
     skip_all = all(not subplan.get("preprocess", True) for subplan in plan.values())
     data_ready = bool(state.get("data_hvg"))
 
     if skip_all and data_ready:
-        print("⏩ [Router] All modalities set preprocess=False and data exists. Skipping Preprocessor.")
+        print("[Router] All modalities set preprocess=False and data exists. Skipping Preprocessor.")
         return "integrator"
 
-    print("➡️ [Router] Proceeding to Preprocessor.")
+    print("[Router] Proceeding to Preprocessor.")
     return "preprocessor"
 
 
 def check_results_quality(state: AgentState) -> str:
-    """
-    初步治理层检查。检查整合结果是否存在，并决定下一步。
-    """
+    """初步治理层检查，若结果存在则继续，否则结束。"""
     error = state.get("error")
     if error:
-        print(f"❌ [Router] Error detected: {error}. Proceeding to Reporter.")
+        print(f"[Router] Error detected: {error}. Proceeding to Reporter.")
         return "reporter"
 
     results = state.get("results", {})
     if not results:
-        print("⚠️ [Router] No integration results found. Proceeding to Reporter.")
+        print("[Router] No integration results found. Proceeding to Reporter.")
         return "reporter"
 
-    print("➡️ [Router] Integration successful. Proceeding to Evaluator.")
+    print("[Router] Integration successful. Proceeding to Evaluator.")
     return "evaluator"
 
 

@@ -2,6 +2,8 @@
 import json
 import logging
 import os
+import re
+from collections import defaultdict
 from typing import Dict, Any, Optional, List
 import pandas as pd
 import numpy as np
@@ -15,7 +17,13 @@ import scipy.sparse as sp
 # from langchain_core.output_parsers import JsonOutputParser
 
 import config
-from tools import OmicsTools, INTEGRATION_METHODS, calculate_graph_connectivity
+from tools import (
+    OmicsTools,
+    INTEGRATION_METHODS,
+    calculate_graph_connectivity,
+    METRIC_SPECS,
+    compute_metric_raw,
+)
 from openai import OpenAI
 client = OpenAI(
     api_key="sk-L1TUuj5pxxyBbg1aNiM2t5fQGdbhAOmJtgVufoXiek3KZLnJ",  
@@ -47,6 +55,12 @@ def canonicalize_method_name(method_name: Any) -> Optional[str]:
     return normalized
 
 
+def sanitize_filename(filename: str) -> str:
+    """Sanitize filenames to avoid illegal chars and overlong paths."""
+    cleaned = re.sub(r'[\\/*?:"<>|]', "_", filename)
+    return cleaned[:255]
+
+
 # ==========================================
 # Base Agent
 # ==========================================
@@ -66,37 +80,168 @@ class BaseAgent:
 class InspectionAgent(BaseAgent):
     """
     读取 data_path 指向的 h5ad 文件，生成 JSON 格式的结构化检查信息，
-    并确定最终使用的 batch_key_effective。
+    并通过 LLM 确定模态、批次键等。
     """
 
     def __init__(self):
         super().__init__("Inspection")
 
-    @staticmethod
-    def inspect_adata(adata: AnnData, modality: str = "RNA") -> dict:
+    def _display_first_rows(self, adata: AnnData) -> Dict[str, Any]:
+        """
+        Return a lightweight preview of obs/var (first 5 rows) for LLM context.
+        """
+        preview = {"obs_head": "", "var_head": ""}
+        
+        # Handle obs preview (first 5 rows)
+        try:
+            if isinstance(adata.obs, pd.DataFrame):
+                obs_preview = adata.obs.head(5)
+                preview["obs_head"] = obs_preview.to_dict(orient="list")
+            elif isinstance(adata.obs, np.ndarray):
+                preview["obs_head"] = adata.obs[:5].tolist()
+            elif sp.issparse(adata.obs):
+                preview["obs_head"] = adata.obs[:5].todense().tolist()
+            else:
+                preview["obs_head"] = "Unknown data type in adata.obs."
+        except Exception as e:
+            preview["obs_head"] = f"Error: {str(e)}"
+        
+        # Handle var preview (first 5 rows)
+        try:
+            if isinstance(adata.var, pd.DataFrame):
+                var_preview = adata.var.head(5)
+                preview["var_head"] = var_preview.to_dict(orient="list")
+            elif isinstance(adata.var, np.ndarray):
+                preview["var_head"] = adata.var[:5].tolist()
+            elif sp.issparse(adata.var):
+                preview["var_head"] = adata.var[:5].todense().tolist()
+            else:
+                preview["var_head"] = "Unknown data type in adata.var."
+        except Exception as e:
+            preview["var_head"] = f"Error: {str(e)}"
+        
+        return preview
+
+
+    def _infer_modality_from_llm(self, adata: AnnData, user_intent: str) -> str:
+        """
+        使用 LLM 根据提供的数据和用户意图推断模态。
+        """
+        obs_columns = adata.obs.columns.tolist()
+        var_columns = adata.var.columns.tolist()
+        n_cells = adata.n_obs
+        n_features = adata.n_vars
+
+        first_rows_info = self._display_first_rows(adata)
+
+        # 额外的诊断信息，帮助 LLM 判断数据的结构
+        logger.info(f"[Inspection] obs columns: {obs_columns}")
+        logger.info(f"[Inspection] var columns: {var_columns}")
+        
+        # 添加更多关于数据内容的信息，比如是否有 celltype 和 gene 信息
+        is_rna = "celltype" in obs_columns and "gene" in var_columns
+        is_atac = "peak" in var_columns and "celltype" in obs_columns
+
+        system_prompt = (
+            "You are a bioinformatics assistant. Based on the data provided, determine the modality of the dataset.\n"
+            "The dataset contains the following metadata:\n"
+            f"  Number of cells: {n_cells}\n"
+            f"  Number of features: {n_features}\n"
+            f"  Observed columns: {obs_columns}\n"
+            f"  Variable columns: {var_columns}\n\n"
+            f"  Obs preview (first 5 rows): {first_rows_info.get('obs_head')}\n"
+            f"  Var preview (first 5 rows): {first_rows_info.get('var_head')}\n\n"
+            "The modalities could be RNA, ATAC, ADT, or others. "
+            "Return ONLY JSON like {\"modality\": \"RNA\"} with modality as RNA/ATAC/ADT/unknown.\n"
+            
+            # 结合 RNA 和 ATAC 的标识
+            "Note: If the data contains gene expressions and cell types in `obs` and `var`, it is likely RNA.\n"
+            "Note: If the data contains peak identifiers and cell types in `obs` and `var`, it is likely ATAC.\n"
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_intent},
+        ]
+
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                temperature=0.0,
+            )
+            content = resp.choices[0].message.content.strip()
+            cleaned = content.replace("```json", "").replace("```", "").strip()
+            m = re.search(r"\{.*\}", cleaned, flags=re.S)
+            payload = m.group(0) if m else cleaned
+            modality_info = json.loads(payload) if payload else {}
+            modality_val = modality_info.get("modality") if isinstance(modality_info, dict) else None
+            logger.info(f"[Inspection] LLM returned modality guess: {modality_val}")
+            return modality_val or "unknown"
+        except Exception as e:
+            logger.error(f"[Inspection] LLM failed to infer modality: {e}")
+            return "unknown"
+    def _infer_batch_key_from_llm(self, adata: AnnData, user_intent: str) -> Optional[str]:
+        """
+        使用 LLM 根据提供的数据和用户意图推断批次列。
+        """
+        obs_columns = adata.obs.columns.tolist()
+        system_prompt = (
+            "You are a bioinformatics assistant. Based on the data provided, determine the best batch key column.\n"
+            f"The dataset observed columns: {obs_columns}\n"
+            "The batch key column could be 'batch', 'batchname', or any other column that represents batch. "
+            "Return ONLY JSON like {\"batch_key\": \"batchname\"} or {\"batch_key\": null}."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_intent},
+        ]
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                temperature=0.0,
+            )
+            content = resp.choices[0].message.content.strip()
+            cleaned = content.replace("```json", "").replace("```", "").strip()
+            m = re.search(r"\{.*\}", cleaned, flags=re.S)
+            payload = m.group(0) if m else cleaned
+            batch_info = json.loads(payload) if payload else {}
+            batch_val = batch_info.get("batch_key") if isinstance(batch_info, dict) else None
+            logger.info(f"[Inspection] LLM returned batch key: {batch_val}")
+            if isinstance(batch_val, str):
+                return batch_val
+            return None
+        except Exception as e:
+            logger.error(f"[Inspection] LLM failed to infer batch key: {e}")
+            return None
+
+    def inspect_adata(self, adata: AnnData, user_intent: str = "Please identify the modality and batch column") -> dict:
+        """
+        LLM-based inspection of the dataset to determine its properties and modality.
+        """
         info: dict[str, Any] = {}
+
+        # 基础统计
         info["n_cells"] = adata.n_obs
         info["n_features"] = adata.n_vars
-
         obs_cols = adata.obs.columns.tolist()
         info["obs_columns"] = obs_cols
         info["var_columns"] = adata.var.columns.tolist()
 
         batch_candidates = [
-            c for c in obs_cols
-            if isinstance(c, str) and "batch" in c.lower()
+            c for c in obs_cols if isinstance(c, str) and "batch" in c.lower()
         ]
         info["batch_candidates"] = batch_candidates
         info["has_batch"] = len(batch_candidates) > 0
-        info["batch_key_effective"] = None
 
-        celltype_cols = [
-            c for c in obs_cols
-            if isinstance(c, str) and ("celltype" in c.lower() or "cell_type" in c.lower())
-        ]
-        info["celltype_available"] = len(celltype_cols) > 0
-        info["celltype_columns"] = celltype_cols
+        # LLM 推断模态和批次键
+        modality_guess = self._infer_modality_from_llm(adata, user_intent)
+        batch_key_effective = self._infer_batch_key_from_llm(adata, user_intent)
+        if batch_key_effective is None and len(batch_candidates) == 1:
+            batch_key_effective = batch_candidates[0]
 
+        # 继续收集其他元信息
         X = adata.X
         if X is None:
             info["matrix_valid"] = False
@@ -141,8 +286,9 @@ class InspectionAgent(BaseAgent):
             "ready_for_integration": ready_for_integration,
         }
 
-        info["modality"] = modality
-        info["modality_guess"] = "rna" if is_integer_like else "unknown"
+        info["modality"] = modality_guess or "unknown"
+        info["modality_guess"] = modality_guess or "unknown"
+        info["batch_key_effective"] = batch_key_effective
 
         return info
 
@@ -164,8 +310,9 @@ class InspectionAgent(BaseAgent):
             logger.info(f"[Inspection] Reading data from: {data_path}")
             adata = sc.read(data_path)
 
-            modality_name = "RNA"
-            info = self.inspect_adata(adata, modality=modality_name)
+            user_intent = state.get("user_intent", "") or "Please identify the modality and batch column"
+            info = self.inspect_adata(adata, user_intent=user_intent)
+            modality_name = info.get("modality") or "unknown"
 
             obs_columns = info.get("obs_columns", [])
             batch_candidates = info.get("batch_candidates") or []
@@ -266,12 +413,7 @@ class InspectionAgent(BaseAgent):
 class PlannerAgent(BaseAgent):
     def __init__(self):
         super().__init__("Planner")
-        # self.llm = ChatOpenAI(
-        #     model=config.LLM_MODEL,
-        #     api_key=config.OPENAI_API_KEY,
-        #     base_url=config.OPENAI_BASE_URL,
-        #     temperature=0
-        # )
+
     def _validate_and_normalize_plan(self, raw_plan: dict, inspection: Dict[str, Any]) -> dict:
         valid_plan = {}
 
@@ -335,56 +477,6 @@ class PlannerAgent(BaseAgent):
             raise ValueError("Planner produced empty plan.")
         return valid_plan
 
-    # def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
-    #     user_intent = state.get("user_intent", "")
-    #     logger.info(f"🤖 [Planner] Analyzing request: {user_intent}")
-    #     inspection = state.get("inspection", {})
-    #     # Prompt: 要求 LLM 返回特定格式的 JSON
-    #     system_prompt = (
-    #         "You are a bioinformatics pipeline planner. "
-    #         "Based on the user request, decide if preprocessing is needed "
-    #         "and list which integration methods to run (choose from: scvi, harmony, mnn, seurat, liger, cca). "
-    #         "Identify the batch key if mentioned, otherwise default to 'batch'.\n\n"
-    #         "Output ONLY a JSON object in this structure:\n"
-    #         "{{\n"
-    #         "  \"RNA\": {{\"preprocess\": true, \"methods\": [\"scvi\", \"harmony\"], \"batch_key\": \"tech\"}},\n"
-    #         "  \"ATAC\": {{\"preprocess\": true, \"methods\": [\"mnn\"], \"batch_key\": null}}\n"
-    #         "}}"
-    #     )
-
-
-
-    #     prompt = ChatPromptTemplate.from_messages([
-    #         ("system", system_prompt),
-    #         ("human", "{input}")
-    #     ])
-
-    #     chain = prompt | self.llm | JsonOutputParser()
-    #     default_plan = {
-    #         "RNA": {
-    #             "preprocess": True,
-    #             "methods": ["scvi", "harmony"],
-    #             "batch_key": "batch",
-    #             "method_params": {}
-    #         }
-    #     }
-
-    #     try:
-    #         response = chain.invoke({"input": user_intent})
-    #         # 清理可能存在的 Markdown 标记
-    #         cleaned_json = response.replace("```json", "").replace("```", "").strip()
-    #         raw_plan = json.loads(cleaned_json)
-            
-    #         # 使用内部 Checker 进行验证和规范化
-    #         plan = self._validate_and_normalize_plan(raw_plan)
-
-    #     except Exception as e:
-    #         logger.error(f"⚠️ Plan parsing or validation failed: {e}. Using default plan.")
-    #         plan = default_plan
-
-    #     state["plan"] = plan
-    #     logger.info(f"📋 [Planner] Plan created: {plan}")
-    #     return state
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
         user_intent = state.get("user_intent", "")
         inspection = state.get("inspection", {})
@@ -393,19 +485,9 @@ class PlannerAgent(BaseAgent):
         # prompt
         system_prompt = (
             "You are a bioinformatics pipeline planner.\n"
-            "Allowed integration methods (canonical names) are: scvi, harmony, mnn, cca, liger.\n"
-            "The name 'cca' means Seurat-CCA integration via the Seurat package.\n"
-            "\n"
-            "You receive inspection info for each modality, which already decided the effective batch key.\n"
-            "DO NOT invent or choose batch columns yourself. You only decide:\n"
-            "  - whether preprocessing is needed (preprocess: true/false)\n"
-            "  - which integration methods to run (subset of: scvi, harmony, mnn, cca, liger)\n"
-            "\n"
-            "For each modality in the inspection, output a JSON object with only 'preprocess' and 'methods'.\n"
-            "Do NOT include 'batch_key' in the JSON.\n"
-            f"Data inspection info: {inspection}\n\n"
-            "Output ONLY a JSON object like:\n"
-            '{ \"RNA\": {\"preprocess\": true, \"methods\": [\"scvi\", \"harmony\", \"cca\"]} }'
+            "Output a concise JSON plan only. Example: {\"RNA\": {\"preprocess\": true, \"methods\": [\"scvi\",\"harmony\"]}}\n"
+            "Include one entry per modality you see, with keys preprocess (true/false) and methods (list of allowed names).\n"
+            "Do not add explanations."
         )
 
         messages = [
@@ -417,9 +499,22 @@ class PlannerAgent(BaseAgent):
             messages=messages,
             temperature=0.0
         )
-        content = resp.choices[0].message.content
-        cleaned_json = content.replace("```json", "").replace("```", "").strip()
-        raw_plan = json.loads(cleaned_json)
+        try:
+            content = resp.choices[0].message.content if resp and resp.choices else ""
+            cleaned = content.replace("```json", "").replace("```", "").strip()
+            m = re.search(r"\{.*\}", cleaned, flags=re.S)
+            raw_plan = json.loads(m.group(0) if m else cleaned) if cleaned else {}
+        except Exception:
+            raw_plan = {}
+
+        ALL = ["scvi", "harmony", "mnn", "cca", "liger"]
+        raw_plan = {
+            m: {
+                "preprocess": bool(raw_plan.get(m, {}).get("preprocess", True)),
+                "methods": ALL
+            }
+            for m in (inspection.keys() or ["RNA"])
+        }
         plan = self._validate_and_normalize_plan(raw_plan, inspection)
 
         inspection_info = state.get("inspection") or {}
@@ -432,6 +527,13 @@ class PlannerAgent(BaseAgent):
                     f"inspection={ins}"
                 )
             subplan["batch_key"] = effective_batch
+
+            # Assign a sanitized integration filename to avoid path issues
+            try:
+                raw_filename = f"integrated_{modality}_{effective_batch}.h5ad"
+                subplan["sanitized_filename"] = sanitize_filename(raw_filename)
+            except Exception:
+                subplan["sanitized_filename"] = None
 
         state["plan"] = plan
         logger.info(f"📋 [Planner] Plan created: {plan}")
@@ -555,7 +657,7 @@ class TuningAgent(BaseAgent):
         method_candidates = sorted(set(method_candidates))
         state["method_candidates"] = method_candidates
 
-        chosen_params: Dict[str, str] = {}
+        chosen_params: Dict[str, List[str]] = {}
         param_presets: Dict[str, Dict[str, Dict[str, Any]]] = {}
         compute_budget = dict(getattr(config, "COMPUTE_BUDGET", {}) or {})
         debug_light = bool(state.get("quick_tuning"))
@@ -571,22 +673,27 @@ class TuningAgent(BaseAgent):
                 if method not in method_candidates or method in chosen_params:
                     continue
 
-                tier_key = default_tier
-                params: Dict[str, Any] = {}
+                method_presets = config.INTEGRATION_METHOD_PRESETS.get(method, {}) or {}
+                tiers = [t for t in ["light", "standard", "high"] if t in method_presets]
+                tiers = (tiers or [default_tier])[:3]
 
-                if method == "scvi":
-                    tier_key, params = self._select_scvi_params(modality_label, n_cells, default_tier, insp)
-                elif method == "harmony":
-                    tier_key, params = self._select_harmony_params(n_cells, n_batches, default_tier)
-                elif method == "mnn":
-                    tier_key, params = self._select_mnn_params(n_batches, default_tier)
-                elif method == "cca":
-                    tier_key, params = self._select_cca_params(default_tier)
-                elif method == "liger":
-                    tier_key, params = self._select_liger_params(modality_label, default_tier)
+                preset_dict: Dict[str, Dict[str, Any]] = {}
+                for t in tiers:
+                    params: Dict[str, Any] = {}
+                    if method == "scvi":
+                        _, params = self._select_scvi_params(modality_label, n_cells, t, insp)
+                    elif method == "harmony":
+                        _, params = self._select_harmony_params(n_cells, n_batches, t)
+                    elif method == "mnn":
+                        _, params = self._select_mnn_params(n_batches, t)
+                    elif method == "cca":
+                        _, params = self._select_cca_params(t)
+                    elif method == "liger":
+                        _, params = self._select_liger_params(modality_label, t)
+                    preset_dict[t] = params
 
-                chosen_params[method] = tier_key
-                param_presets[method] = {tier_key: params}
+                chosen_params[method] = tiers
+                param_presets[method] = preset_dict
 
         # TODO: multi-preset benchmarking and populating param_results with metrics
         state["chosen_params"] = chosen_params
@@ -594,14 +701,22 @@ class TuningAgent(BaseAgent):
         state["param_results"] = {}
         state["compute_budget"] = compute_budget
 
+        if state.get("search_params", True):
+            return state
+
         # Merge presets into plan
         for modality, subplan in plan.items():
             methods_cfg = subplan.get("methods") or {}
             merged_methods: Dict[str, Dict[str, Any]] = {}
             for method, base_params in methods_cfg.items():
                 preset_name = chosen_params.get(method)
-                if preset_name:
-                    preset_values = param_presets.get(method, {}).get(preset_name, {}) or {}
+                if isinstance(preset_name, list):
+                    preset_key = preset_name[0] if preset_name else None
+                else:
+                    preset_key = preset_name
+
+                if preset_key:
+                    preset_values = param_presets.get(method, {}).get(preset_key, {}) or {}
                     merged_methods[method] = {**(base_params or {}), **preset_values}
                 else:
                     merged_methods[method] = base_params or {}
@@ -628,6 +743,10 @@ class PreprocessAgent(BaseAgent):
             state["data_hvg"] = {}
         if not isinstance(state.get("data_raw"), dict):
             state["data_raw"] = {}
+        if not isinstance(state.get("data_hvg_full"), dict):
+            state["data_hvg_full"] = {}
+        if not isinstance(state.get("data_raw_full"), dict):
+            state["data_raw_full"] = {}
 
         for modality, subplan in plan.items():
             batch_key = subplan.get("batch_key", "batch")
@@ -635,7 +754,16 @@ class PreprocessAgent(BaseAgent):
             adata_existing = state["data_hvg"].get(modality)
             modality_param = subplan.get("modality", modality)
 
+            # Store a sanitized preprocessing output filename to avoid path issues
+            try:
+                raw_preproc_name = f"{modality}_preprocessed_{batch_key}.h5ad"
+                subplan["sanitized_preprocessed_filename"] = sanitize_filename(raw_preproc_name)
+            except Exception:
+                subplan["sanitized_preprocessed_filename"] = None
+
             if not preprocess_flag and adata_existing is not None:
+                state["data_hvg_full"].setdefault(modality, adata_existing)
+                state["data_raw_full"].setdefault(modality, state["data_raw"].get(modality))
                 logger.info(f"✅ [Preprocessor] Skipped {modality}")
                 continue
 
@@ -646,6 +774,8 @@ class PreprocessAgent(BaseAgent):
                     original_batch_key=batch_key,
                     modality=modality_param
                 )
+                state["data_hvg_full"][modality] = adata_hvg.copy()
+                state["data_raw_full"][modality] = adata_raw.copy() if adata_raw is not None else None
                 # Subsample for benchmark mode
                 if benchmark_fraction is not None:
                     try:
@@ -711,23 +841,37 @@ class IntegrationAgent(BaseAgent):
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
         plan = state.get("plan", {})
         run_all_methods_flag = bool(state.get("run_all_methods", False))
+        top1_only = bool(state.get("top1_only", True))
 
-        if "results" not in state:
-            state["results"] = {}
+        state.setdefault("results", {})
+        state.setdefault("param_search_results", [])
+        state.setdefault("best_params", {})
+        state.setdefault("best_rank", {})
+        state.setdefault("method_errors", {})
+        state.setdefault("final_selection", {})
 
         adata_hvg_all = state.get("data_hvg") or {}
         adata_raw_all = state.get("data_raw") or {}
+        adata_hvg_full_all = state.get("data_hvg_full") or {}
+        adata_raw_full_all = state.get("data_raw_full") or {}
 
         if not adata_hvg_all:
             raise RuntimeError("No input data found for integration.")
 
         for modality, subplan in plan.items():
             batch_key = "batch"  # downstream integration统一使用标准化后的 batch 列
-            adata_hvg = adata_hvg_all.get(modality)
-            adata_raw = adata_raw_all.get(modality)
+            adata_hvg_bm = adata_hvg_all.get(modality)
+            adata_raw_bm = adata_raw_all.get(modality)
+            adata_hvg_full = adata_hvg_full_all.get(modality, adata_hvg_bm)
+            adata_raw_full = adata_raw_full_all.get(modality, adata_raw_bm)
 
-            if adata_hvg is None:
+            if adata_hvg_bm is None:
                 raise RuntimeError(f"No input data found for modality '{modality}'")
+
+            state["results"].setdefault(modality, {})
+            state["method_errors"].setdefault(modality, {})
+            state["best_params"][modality] = {}
+            state["best_rank"][modality] = []
 
             if subplan.get("methods"):
                 methods_cfg = self._extract_methods_config(subplan["methods"])
@@ -738,37 +882,120 @@ class IntegrationAgent(BaseAgent):
                 methods_cfg = self._extract_methods_config(subplan.get("methods", {}))
 
             if not methods_cfg:
-                raise RuntimeError(f"No integration methods configured for modality '{modality}'")
-
-            state["results"].setdefault(modality, {})
+                methods_cfg = {name: {} for name in INTEGRATION_METHODS.keys()}
 
             for method_name, method_params in methods_cfg.items():
                 runner = INTEGRATION_METHODS.get(method_name)
                 if runner is None:
-                    raise KeyError(f"Unknown integration method '{method_name}' for {modality}")
+                    state["method_errors"][modality][method_name] = "Unknown integration method"
+                    continue
 
-                try:
-                    result_adata = runner(
-                        adata_hvg,
-                        adata_raw,
-                        batch_key=batch_key,
-                        **(method_params or {})
-                    )
+                presets = state.get("param_presets", {}).get(method_name, {}) or {}
+                candidates = list(presets.items())[:3]
+                if not candidates:
+                    candidates = [("single", method_params or {})]
+
+                best_score = None
+                best_params_for_method: Dict[str, Any] | None = None
+
+                for tier, params in candidates:
+                    record = {
+                        "modality": modality,
+                        "method": method_name,
+                        "tier": tier,
+                        "gc": None,
+                        "basw": None,
+                        "score": None,
+                        "error": None,
+                    }
+                    try:
+                        result_adata = runner(
+                            adata_hvg_bm,
+                            adata_raw_bm,
+                            batch_key=batch_key,
+                            **(params or {})
+                        )
+                    except Exception as e:
+                        record["error"] = str(e)
+                        state["param_search_results"].append(record)
+                        continue
 
                     if result_adata is None:
-                        raise RuntimeError(f"Integration method '{method_name}' returned None for modality '{modality}'")
+                        record["error"] = "Returned None"
+                        state["param_search_results"].append(record)
+                        continue
 
                     embedding_key = f"X_{method_name}"
                     if embedding_key not in result_adata.obsm:
-                        raise KeyError(f"Method '{method_name}' result missing expected embedding '{embedding_key}'")
+                        record["error"] = f"Missing embedding {embedding_key}"
+                        state["param_search_results"].append(record)
+                        continue
 
-                    state["results"][modality][method_name] = result_adata
-                    logger.info(f"✅ [Integrator] {method_name} finished for {modality}")
+                    emb = result_adata.obsm[embedding_key]
+                    gc_value = None
+                    try:
+                        gc_value = calculate_graph_connectivity(emb, n_neighbors=15, n_cells=emb.shape[0])
+                    except Exception:
+                        gc_value = None
 
+                    basw = 0.0
+                    try:
+                        if "batch" in result_adata.obs and result_adata.obs["batch"].nunique() >= 2:
+                            basw = float(silhouette_score(emb, result_adata.obs["batch"]))
+                    except Exception:
+                        basw = 0.0
+
+                    score = (gc_value if gc_value is not None else 0.0) - basw
+
+                    record.update({"gc": gc_value, "basw": basw, "score": score})
+                    state["param_search_results"].append(record)
+
+                    if (best_score is None) or (score > best_score):
+                        best_score = score
+                        best_params_for_method = params
+
+                if best_params_for_method is not None:
+                    state["best_params"][modality][method_name] = best_params_for_method
+                    state["best_rank"][modality].append((method_name, best_score if best_score is not None else 0.0))
+                else:
+                    state["method_errors"][modality][method_name] = "No valid params in benchmark"
+
+            ranked = sorted(state["best_rank"].get(modality, []), key=lambda x: x[1], reverse=True)
+            if not ranked:
+                continue
+
+            top_methods = ranked[:1] if top1_only else ranked
+            for top_method, top_score in top_methods:
+                runner = INTEGRATION_METHODS.get(top_method)
+                if runner is None:
+                    state["method_errors"][modality][top_method] = "Unknown integration method"
+                    continue
+                params = state["best_params"][modality].get(top_method, {})
+                try:
+                    result_adata = runner(
+                        adata_hvg_full,
+                        adata_raw_full,
+                        batch_key=batch_key,
+                        **(params or {})
+                    )
                 except Exception as e:
-                    logger.error(f"🛑 [Integrator] Error running {method_name} on {modality}: {e}")
-                    state["error"] = str(e)
-                    raise
+                    state["method_errors"][modality][top_method] = str(e)
+                    continue
+
+                if result_adata is None:
+                    state["method_errors"][modality][top_method] = "Returned None on full data"
+                    continue
+
+                embedding_key = f"X_{top_method}"
+                if embedding_key not in result_adata.obsm:
+                    state["method_errors"][modality][top_method] = f"Missing embedding {embedding_key} on full data"
+                    continue
+
+                state["results"][modality][top_method] = result_adata
+                state["final_selection"][modality] = {"method": top_method, "params": params, "score": top_score}
+
+                if top1_only:
+                    break
 
         return state
 
@@ -779,61 +1006,159 @@ class EvaluationAgent(BaseAgent):
     def __init__(self):
         super().__init__("Evaluator")
 
-    def _compute_batch_asw(self, embedding: np.ndarray, labels: pd.Series) -> Optional[float]:
-        unique_labels = labels.dropna().unique()
-        if len(unique_labels) < 2 or embedding.shape[0] <= len(unique_labels):
-            return None
-        try:
-            return float(silhouette_score(embedding, labels))
-        except Exception as e:
-            logger.warning(f"Batch ASW failed: {e}")
-            return None
+    def _get_celltype_key(
+        self,
+        modality: str,
+        adata_integrated: sc.AnnData,
+        inspection: Dict[str, Any],
+    ) -> Optional[str]:
+        if "celltype" in adata_integrated.obs:
+            return "celltype"
+        if "final_cell_label" in adata_integrated.obs:
+            return "final_cell_label"
+        insp = inspection.get(modality) or {}
+        cols = insp.get("celltype_columns") or []
+        return cols[0] if cols else None
 
-    def _compute_celltype_asw(self, embedding: np.ndarray, labels: pd.Series) -> Optional[float]:
-        unique_labels = labels.dropna().unique()
-        if len(unique_labels) < 2 or embedding.shape[0] <= len(unique_labels):
-            return None
-        try:
-            return float(silhouette_score(embedding, labels))
-        except Exception as e:
-            logger.warning(f"Celltype ASW failed: {e}")
-            return None
+    def _get_cluster_key(self, method_name: str, adata_integrated: sc.AnnData) -> Optional[str]:
+        if method_name == "mnn" and "leiden_mnn" in adata_integrated.obs:
+            return "leiden_mnn"
+        if "leiden" in adata_integrated.obs:
+            return "leiden"
+        if method_name == "cca" and "cca_cluster" in adata_integrated.obs:
+            return "cca_cluster"
+        if method_name == "liger" and "liger_cluster" in adata_integrated.obs:
+            return "liger_cluster"
+        return None
+
+    def _task_minmax(self, metric_id: str, values_by_method: Dict[str, Optional[float]]) -> Dict[str, Optional[float]]:
+        standardized: Dict[str, Optional[float]] = {}
+        finite_vals = [v for v in values_by_method.values() if v is not None]
+        if not finite_vals:
+            return {m: None for m in values_by_method}
+        min_v = min(finite_vals)
+        max_v = max(finite_vals)
+        direction = (METRIC_SPECS.get(metric_id, {}) or {}).get("direction", "higher_better")
+
+        for method, raw_value in values_by_method.items():
+            if raw_value is None:
+                standardized[method] = None
+                continue
+            if max_v == min_v:
+                standardized[method] = 0.5
+                continue
+            if direction == "higher_better":
+                norm = (raw_value - min_v) / (max_v - min_v)
+            elif direction == "lower_better":
+                norm = (max_v - raw_value) / (max_v - min_v)
+            else:  # zero_best
+                norm = 1.0 - (abs(raw_value) / max(abs(min_v), abs(max_v)))
+            standardized[method] = float(np.clip(norm, 0.0, 1.0))
+        return standardized
+
+    def _aggregate_group(
+        self,
+        metric_ids: List[str],
+        normalized_scores: Dict[str, Optional[float]],
+    ) -> tuple[float, float]:
+        if not metric_ids:
+            return 0.0, 0.0
+        total = 0.0
+        weight_sum = 0.0
+        available = 0
+        for mid in metric_ids:
+            val = normalized_scores.get(mid)
+            if val is None:
+                continue
+            weight = float(METRIC_SPECS.get(mid, {}).get("weight", 1.0))
+            total += weight * val
+            weight_sum += weight
+            available += 1
+        coverage = available / len(metric_ids)
+        if available == 0 or weight_sum == 0.0:
+            return 0.0, coverage
+        base = total / weight_sum
+        return float(base * np.sqrt(coverage)), coverage
 
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
         results = state.get("results") or {}
-        records = []
+        inspection = state.get("inspection") or {}
+        adata_full = state.get("data_hvg_full") or {}
 
+        raw_scores: Dict[str, Dict[str, Dict[str, Optional[float]]]] = defaultdict(lambda: defaultdict(dict))
+        normalized_scores: Dict[str, Dict[str, Dict[str, Optional[float]]]] = defaultdict(lambda: defaultdict(dict))
+        group_scores: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(lambda: defaultdict(dict))
+        final_scores: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
+        # Build group mapping from METRIC_SPECS
+        group_to_metrics: Dict[str, List[str]] = defaultdict(list)
+        for mid, spec in METRIC_SPECS.items():
+            group = (spec.get("group") or "").lower()
+            if group:
+                group_to_metrics[group].append(mid)
+
+        # Stage 1: collect raw scores
         for modality, methods in results.items():
-            if not methods:
-                continue
-            for method_name, adata in methods.items():
+            for method_name, adata in (methods or {}).items():
                 embedding_key = f"X_{method_name}"
                 if embedding_key not in adata.obsm:
                     logger.warning(f"[Evaluation] Missing embedding {embedding_key} for {modality}-{method_name}, skip.")
                     continue
 
-                emb = adata.obsm[embedding_key]
-                # Graph connectivity (simple fallback)
-                try:
-                    gc_value = calculate_graph_connectivity(emb, n_neighbors=15, n_cells=emb.shape[0])
-                    records.append({"modality": modality, "method": method_name, "metric": "graph_connectivity", "value": gc_value})
-                except Exception as e:
-                    logger.warning(f"[Evaluation] Graph connectivity failed for {modality}-{method_name}: {e}")
+                celltype_key = self._get_celltype_key(modality, adata, inspection)
+                cluster_key = self._get_cluster_key(method_name, adata)
+                for metric_id in METRIC_SPECS.keys():
+                    raw_value = compute_metric_raw(
+                        metric_id=metric_id,
+                        adata_integrated=adata,
+                        adata_unintegrated=adata_full.get(modality),
+                        embedding_key=embedding_key,
+                        modality=modality,
+                        batch_key="batch",
+                        celltype_key=celltype_key,
+                        cluster_key=cluster_key,
+                    )
+                    raw_scores[modality][method_name][metric_id] = raw_value
 
-                # Batch ASW
-                if "batch" in adata.obs:
-                    batch_val = self._compute_batch_asw(emb, adata.obs["batch"])
-                    if batch_val is not None:
-                        records.append({"modality": modality, "method": method_name, "metric": "batch_asw", "value": batch_val})
+        # Stage 2: normalize per metric within each modality
+        for modality, method_metrics in raw_scores.items():
+            for metric_id in METRIC_SPECS.keys():
+                values_by_method = {m: metrics.get(metric_id) for m, metrics in method_metrics.items()}
+                standardized = self._task_minmax(metric_id, values_by_method)
+                for m, val in standardized.items():
+                    normalized_scores[modality][m][metric_id] = val
 
-                # Celltype ASW
-                if "celltype" in adata.obs:
-                    ct_val = self._compute_celltype_asw(emb, adata.obs["celltype"])
-                    if ct_val is not None:
-                        records.append({"modality": modality, "method": method_name, "metric": "celltype_asw", "value": ct_val})
+        # Stage 3: group aggregation with coverage penalty
+        for modality, methods in normalized_scores.items():
+            for method_name, metrics in methods.items():
+                group_scores[modality][method_name] = {}
+                for group_key, metric_list in group_to_metrics.items():
+                    agg, _coverage = self._aggregate_group(metric_list, metrics)
+                    group_scores[modality][method_name][group_key] = agg
 
-        eval_df = pd.DataFrame(records, columns=["modality", "method", "metric", "value"])
-        state["evaluation"] = eval_df
+        # Stage 4: final score per modality
+        for modality, methods in group_scores.items():
+            for method_name, groups in methods.items():
+                bio = groups.get("bio_label", 0.0)
+                batch = groups.get("batch", 0.0)
+                bio_free = groups.get("bio_label_free", 0.0)
+                cross = groups.get("cross_modal", 0.0)
+                score = 0.6 * bio + 0.4 * batch + 0.0 * bio_free + 0.0 * cross
+                final_scores[modality].append(
+                    {
+                        "method": method_name,
+                        "score": score,
+                        "groups": groups,
+                    }
+                )
+            final_scores[modality] = sorted(final_scores[modality], key=lambda x: x["score"], reverse=True)
+
+        state["evaluation"] = {
+            "raw": raw_scores,
+            "normalized": normalized_scores,
+            "group_scores": group_scores,
+            "final_scores": final_scores,
+        }
         return state
 
 # ==========================================
@@ -871,17 +1196,43 @@ class ReporterAgent(BaseAgent):
                 print(f"[{modality}] {method}: cells={adata.n_obs}, features={adata.n_vars}, embeddings={emb_keys}")
 
     @staticmethod
-    def _print_evaluation(eval_df: Optional[pd.DataFrame]):
+    def _print_final_selection(final_selection: Dict[str, Any]):
+        if not final_selection:
+            return
+        print("\n--- Final Selection ---")
+        for modality, info in final_selection.items():
+            method = info.get("method")
+            score = info.get("score")
+            print(f"[{modality}] method={method}, score={score}, params={info.get('params')}")
+
+    @staticmethod
+    def _print_evaluation(eval_obj: Optional[Any]):
         print("\n--- Evaluation ---")
-        if eval_df is None or eval_df.empty:
+        if eval_obj is None:
             print("No evaluation metrics were computed.")
             return
-        for metric, subdf in eval_df.groupby("metric"):
-            best_val = subdf["value"].max()
-            print(f"\nMetric: {metric}")
-            for _, row in subdf.iterrows():
-                star = " *" if row["value"] == best_val else ""
-                print(f"  {row['modality']} - {row['method']}: {row['value']:.4f}{star}")
+        if isinstance(eval_obj, pd.DataFrame):
+            if eval_obj.empty:
+                print("No evaluation metrics were computed.")
+                return
+            for metric, subdf in eval_obj.groupby("metric"):
+                best_val = subdf["value"].max()
+                print(f"\nMetric: {metric}")
+                for _, row in subdf.iterrows():
+                    star = " *" if row["value"] == best_val else ""
+                    print(f"  {row['modality']} - {row['method']}: {row['value']:.4f}{star}")
+            return
+        if isinstance(eval_obj, dict):
+            final_scores = eval_obj.get("final_scores") or {}
+            if not final_scores:
+                print("Evaluation structure present but empty.")
+                return
+            for modality, entries in final_scores.items():
+                print(f"\n[{modality}] Final Scores:")
+                for rec in entries:
+                    print(f"  {rec.get('method')}: {rec.get('score'):.4f}")
+            return
+        print("Unknown evaluation format.")
 
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
         print("\n===== OMICS INTEGRATION REPORT =====")
@@ -889,6 +1240,7 @@ class ReporterAgent(BaseAgent):
             print(f"ERROR: {state.get('error')}")
         self._print_plan(state.get("plan") or {})
         self._print_results(state.get("results") or {})
+        self._print_final_selection(state.get("final_selection") or {})
         self._print_evaluation(state.get("evaluation"))
 
         chosen_params = state.get("chosen_params") or {}

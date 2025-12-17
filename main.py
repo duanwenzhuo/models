@@ -16,7 +16,7 @@ def main():
 
     initial_state = {
         "user_intent": (
-            "Load the pancreas data. I want to perform scVI and Harmony integration, "
+            "Load the data. I want to perform integration, "
             "and automatically detect the appropriate batch column from the metadata."
         ),
         "data_path": data_path,
@@ -29,6 +29,10 @@ def main():
         "report_path": None,
         "benchmark_fraction": 0.2,
         "run_all_methods": True,
+        "search_params": True,
+        "top1_only": True,
+        "data_hvg_full": {},
+        "data_raw_full": {},
         "logs": [],
         "error": None,
     }
