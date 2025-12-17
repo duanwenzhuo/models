@@ -3,7 +3,10 @@ import os
 from typing import Any, Dict
 
 # API configuration
-OPENAI_API_KEY = "sk-zkpUDC0kaZNSO4WH8NO0D6emiirhFWDFpKbsXTdh0EF42yTu"
+OPENAI_API_KEY = 
+
+
+
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 LLM_MODEL = "gpt-4o"
 
