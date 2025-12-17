@@ -2,13 +2,15 @@
 import json
 import logging
 import os
-from typing import Dict, Any, Optional, List
-import pandas as pd
+import re
+from typing import Dict, Any, Optional, List, Tuple
+
 import numpy as np
+import pandas as pd
 import scanpy as sc
+import scipy.sparse as sp
 from anndata import AnnData
 from sklearn.metrics import silhouette_score
-import scipy.sparse as sp
 
 # from langchain_openai import ChatOpenAI
 # from langchain.prompts import ChatPromptTemplate
@@ -17,13 +19,26 @@ import scipy.sparse as sp
 import config
 from tools import OmicsTools, INTEGRATION_METHODS, calculate_graph_connectivity
 from openai import OpenAI
-client = OpenAI(
-    api_key="sk-L1TUuj5pxxyBbg1aNiM2t5fQGdbhAOmJtgVufoXiek3KZLnJ",  
-    base_url="https://api.lmtgpt.top/v1"  
-)
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def build_openai_client() -> Optional[OpenAI]:
+    """Instantiate an OpenAI client if credentials are available."""
+    api_key = os.getenv("OPENAI_API_KEY") or getattr(config, "OPENAI_API_KEY", "")
+    base_url = os.getenv("OPENAI_BASE_URL") or getattr(config, "OPENAI_BASE_URL", "")
+    if not api_key:
+        logger.warning("[LLM] OPENAI_API_KEY not set; LLM-backed steps will use fallbacks.")
+        return None
+    try:
+        return OpenAI(api_key=api_key, base_url=base_url or None)
+    except Exception as exc:
+        logger.warning(f"[LLM] Failed to initialize OpenAI client: {exc}. Falling back to offline heuristics.")
+        return None
+
+
+openai_client = build_openai_client()
 
 # Integration method normalization helpers
 ALLOWED_INTEGRATION_METHODS = {"scvi", "harmony", "mnn", "cca", "liger"}
@@ -45,6 +60,76 @@ def canonicalize_method_name(method_name: Any) -> Optional[str]:
     if normalized not in ALLOWED_INTEGRATION_METHODS:
         return None
     return normalized
+
+
+def detect_modalities_from_text(text: str) -> List[str]:
+    """
+    Very lightweight heuristic modality detector based on keywords in the task
+    description. Returns an ordered list with the highest-confidence modality
+    first. Defaults to RNA when nothing is recognized.
+    """
+    lowered = (text or "").lower()
+    modalities: List[str] = []
+
+    keyword_map = [
+        ("spatial", "RNA"),
+        ("spatial transcriptomics", "RNA"),
+        ("scrna", "RNA"),
+        ("rna", "RNA"),
+        ("transcriptome", "RNA"),
+        ("atac", "ATAC_gene_activity"),
+        ("chromatin", "ATAC_gene_activity"),
+        ("gene activity", "ATAC_gene_activity"),
+    ]
+    for kw, modality in keyword_map:
+        if kw in lowered and modality not in modalities:
+            modalities.append(modality)
+
+    if not modalities:
+        modalities.append("RNA")
+    return modalities
+
+
+def infer_preprocess_strategy(text: str) -> Tuple[bool, str]:
+    """
+    Decide whether preprocessing is required and pick a suggested tool name.
+    Returns (need_preprocess, suggested_tool).
+    """
+    lowered = (text or "").lower()
+    if any(word in lowered for word in ["raw", "normalize", "preprocess", "qc", "filter"]):
+        return True, "Seurat"
+    if any(word in lowered for word in ["batch", "integration", "correct"]):
+        return True, "Harmony"
+    return True, "Standard"
+
+
+def extract_subset_request(text: str) -> Dict[str, List[str]]:
+    """
+    Parse the free-text task description to extract optional gene or cell-type
+    subset constraints. The heuristics intentionally err on the side of being
+    conservative to avoid dropping data unexpectedly.
+    """
+    subset: Dict[str, List[str]] = {"genes": [], "celltypes": []}
+    if not text:
+        return subset
+
+    gene_blocks = re.findall(r"genes?[:\(]\s*([^\)\n]+)", text, flags=re.IGNORECASE)
+    for block in gene_blocks:
+        for token in re.split(r"[,\s]+", block):
+            token_clean = token.strip()
+            if len(token_clean) >= 2 and token_clean.isupper():
+                subset["genes"].append(token_clean)
+
+    cell_blocks = re.findall(r"cells?[:\(]\s*([^\)\n]+)", text, flags=re.IGNORECASE)
+    for block in cell_blocks:
+        for token in re.split(r"[,/]+", block):
+            token_clean = token.strip()
+            if token_clean:
+                subset["celltypes"].append(token_clean)
+
+    subset["genes"] = sorted(set(subset["genes"]))
+    subset["celltypes"] = sorted(set(subset["celltypes"]))
+    return subset
 
 
 # ==========================================
@@ -148,6 +233,9 @@ class InspectionAgent(BaseAgent):
 
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
         data_path = state.get("data_path")
+        user_intent = state.get("user_intent", "")
+        detected_modalities = state.get("modalities") or detect_modalities_from_text(user_intent)
+
         if not data_path:
             msg = "[Inspection] data_path is missing in state."
             logger.error(msg)
@@ -164,13 +252,13 @@ class InspectionAgent(BaseAgent):
             logger.info(f"[Inspection] Reading data from: {data_path}")
             adata = sc.read(data_path)
 
-            modality_name = "RNA"
+            modality_name = detected_modalities[0] if detected_modalities else "RNA"
             info = self.inspect_adata(adata, modality=modality_name)
 
             obs_columns = info.get("obs_columns", [])
             batch_candidates = info.get("batch_candidates") or []
-            user_intent = state.get("user_intent", "")
-
+            client = state.get("openai_client") or openai_client
+            state["openai_client"] = client
             if not batch_candidates:
                 msg = (
                     f"Inspection found no batch-like columns for modality '{modality_name}'. "
@@ -188,60 +276,67 @@ class InspectionAgent(BaseAgent):
                 )
 
             if batch_key_effective is None and len(batch_candidates) > 1:
-                try:
-                    system_prompt = (
-                        "You are a bioinformatics assistant helping to choose the batch key column "
-                        "for single-cell integration.\n"
-                        "You are given:\n"
-                        "  - a free-text user request (may mention words like 'tech', "
-                        "    'technology', 'experiment', 'sample', 'batch', etc.),\n"
-                        "  - a list of all obs columns, and\n"
-                        "  - a list of batch-like candidate columns (column names that contain 'batch').\n\n"
-                        "Your job is to choose exactly ONE column name from the candidate list to use as the batch key.\n"
-                        "If none of the candidates make sense, return null.\n\n"
-                        "Return ONLY a JSON object of the form:\n"
-                        "{\n"
-                        '  \"batch_key\": \"<one_of_the_candidate_columns_or_null>\",\n'
-                        '  \"reason\": \"<short explanation>\"\n'
-                        "}\n"
-                    )
-
-                    user_message = (
-                        f"User intent: {user_intent}\n"
-                        f"All obs columns: {obs_columns}\n"
-                        f"Batch-like candidates: {batch_candidates}\n\n"
-                        "If the user mentions e.g. 'tech' or 'technology', map that to the most appropriate column "
-                        "among the candidates. If unsure, choose the column that most clearly represents batch."
-                    )
-
-                    resp = client.chat.completions.create(
-                        model="gpt-4o",
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_message},
-                        ],
-                        temperature=0.0,
-                    )
-                    content = resp.choices[0].message.content
-                    cleaned = content.replace("```json", "").replace("```", "").strip()
-                    parsed = json.loads(cleaned)
-                    candidate = parsed.get("batch_key")
-
-                    if isinstance(candidate, str) and candidate in obs_columns:
-                        batch_key_effective = candidate
-                        info["batch_key_effective"] = candidate
-                        logger.info(
-                            f"[Inspection] LLM chose batch_key_effective='{candidate}' "
-                            f"from candidates={batch_candidates}"
-                        )
-                    else:
-                        logger.error(
-                            f"[Inspection] LLM did not return a valid batch_key from candidates. "
-                            f"parsed={parsed}"
+                if client:
+                    try:
+                        system_prompt = (
+                            "You are a bioinformatics assistant helping to choose the batch key column "
+                            "for single-cell integration.\n"
+                            "You are given:\n"
+                            "  - a free-text user request (may mention words like 'tech', "
+                            "    'technology', 'experiment', 'sample', 'batch', etc.),\n"
+                            "  - a list of all obs columns, and\n"
+                            "  - a list of batch-like candidate columns (column names that contain 'batch').\n\n"
+                            "Your job is to choose exactly ONE column name from the candidate list to use as the batch key.\n"
+                            "If none of the candidates make sense, return null.\n\n"
+                            "Return ONLY a JSON object of the form:\n"
+                            "{\n"
+                            '  \"batch_key\": \"<one_of_the_candidate_columns_or_null>\",\n'
+                            '  \"reason\": \"<short explanation>\"\n'
+                            "}\n"
                         )
 
-                except Exception as e:
-                    logger.error(f"[Inspection] LLM-based batch_key selection failed: {e}")
+                        user_message = (
+                            f"User intent: {user_intent}\n"
+                            f"All obs columns: {obs_columns}\n"
+                            f"Batch-like candidates: {batch_candidates}\n\n"
+                            "If the user mentions e.g. 'tech' or 'technology', map that to the most appropriate column "
+                            "among the candidates. If unsure, choose the column that most clearly represents batch."
+                        )
+
+                        resp = client.chat.completions.create(
+                            model=config.LLM_MODEL,
+                            messages=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_message},
+                            ],
+                            temperature=0.0,
+                        )
+                        content = resp.choices[0].message.content
+                        cleaned = content.replace("```json", "").replace("```", "").strip()
+                        parsed = json.loads(cleaned)
+                        candidate = parsed.get("batch_key")
+
+                        if isinstance(candidate, str) and candidate in obs_columns:
+                            batch_key_effective = candidate
+                            info["batch_key_effective"] = candidate
+                            logger.info(
+                                f"[Inspection] LLM chose batch_key_effective='{candidate}' "
+                                f"from candidates={batch_candidates}"
+                            )
+                        else:
+                            logger.error(
+                                f"[Inspection] LLM did not return a valid batch_key from candidates. "
+                                f"parsed={parsed}"
+                            )
+
+                    except Exception as e:
+                        logger.error(f"[Inspection] LLM-based batch_key selection failed: {e}")
+                else:
+                    batch_key_effective = batch_candidates[0]
+                    info["batch_key_effective"] = batch_key_effective
+                    logger.info(
+                        f"[Inspection] No LLM client; defaulting to first batch candidate '{batch_key_effective}'."
+                    )
 
             if info.get("batch_key_effective") is None:
                 msg = (
@@ -335,6 +430,21 @@ class PlannerAgent(BaseAgent):
             raise ValueError("Planner produced empty plan.")
         return valid_plan
 
+    def _fallback_plan(self, inspection: Dict[str, Any], detected_modalities: List[str]) -> dict:
+        """Return a reasonable offline plan when no LLM client is configured."""
+        plan: Dict[str, Any] = {}
+        modalities = detected_modalities or list(inspection.keys()) or ["RNA"]
+
+        for modality in modalities:
+            insp = inspection.get(modality) or next(iter(inspection.values()), {})
+            batch_key_effective = insp.get("batch_key_effective") or "batch"
+            plan[modality] = {
+                "preprocess": True,
+                "methods": {m: {} for m in ["scvi", "harmony", "cca", "mnn"]},
+                "batch_key": batch_key_effective,
+            }
+        return plan
+
     # def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
     #     user_intent = state.get("user_intent", "")
     #     logger.info(f"🤖 [Planner] Analyzing request: {user_intent}")
@@ -388,7 +498,13 @@ class PlannerAgent(BaseAgent):
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
         user_intent = state.get("user_intent", "")
         inspection = state.get("inspection", {})
+        detected_modalities = detect_modalities_from_text(user_intent)
+        state["modalities"] = detected_modalities
+        state["subset_filters"] = extract_subset_request(user_intent)
         logger.info(f"🤖 [Planner] Analyzing request: {user_intent}")
+
+        client = state.get("openai_client") or openai_client
+        state["openai_client"] = client
 
         # prompt
         system_prompt = (
@@ -408,19 +524,27 @@ class PlannerAgent(BaseAgent):
             '{ \"RNA\": {\"preprocess\": true, \"methods\": [\"scvi\", \"harmony\", \"cca\"]} }'
         )
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_intent}
-        ]
-        resp = client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-            temperature=0.0
-        )
-        content = resp.choices[0].message.content
-        cleaned_json = content.replace("```json", "").replace("```", "").strip()
-        raw_plan = json.loads(cleaned_json)
-        plan = self._validate_and_normalize_plan(raw_plan, inspection)
+        plan = {}
+        if client:
+            try:
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_intent}
+                ]
+                resp = client.chat.completions.create(
+                    model=config.LLM_MODEL,
+                    messages=messages,
+                    temperature=0.0
+                )
+                content = resp.choices[0].message.content
+                cleaned_json = content.replace("```json", "").replace("```", "").strip()
+                raw_plan = json.loads(cleaned_json)
+                plan = self._validate_and_normalize_plan(raw_plan, inspection)
+            except Exception as exc:
+                logger.warning(f"[Planner] LLM planning failed, using fallback plan. Error: {exc}")
+
+        if not plan:
+            plan = self._fallback_plan(inspection, detected_modalities)
 
         inspection_info = state.get("inspection") or {}
         for modality, subplan in plan.items():
@@ -432,6 +556,20 @@ class PlannerAgent(BaseAgent):
                     f"inspection={ins}"
                 )
             subplan["batch_key"] = effective_batch
+
+            need_preprocess, preprocess_tool = infer_preprocess_strategy(user_intent)
+            subplan["preprocess"] = subplan.get("preprocess", need_preprocess)
+            subplan["preprocess_tool"] = preprocess_tool
+
+        for modality in detected_modalities:
+            if modality not in plan:
+                need_preprocess, preprocess_tool = infer_preprocess_strategy(user_intent)
+                plan[modality] = {
+                    "preprocess": need_preprocess,
+                    "preprocess_tool": preprocess_tool,
+                    "batch_key": next(iter(inspection_info.values()), {}).get("batch_key_effective", "batch"),
+                    "methods": {m: {} for m in ALLOWED_INTEGRATION_METHODS},
+                }
 
         state["plan"] = plan
         logger.info(f"📋 [Planner] Plan created: {plan}")
@@ -530,6 +668,36 @@ class TuningAgent(BaseAgent):
         params = self._safe_copy(tier_tree.get(modality_key))
         return tier_key, params
 
+    def _build_param_grid(self, method: str, modality_label: str, insp: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        grid: Dict[str, Dict[str, Any]] = {}
+        n_cells = insp.get("n_cells")
+        n_batches = len(insp.get("batch_candidates") or [])
+
+        if method == "scvi":
+            for tier in ["light", "standard", "high"]:
+                _, params = self._select_scvi_params(modality_label, n_cells, tier, insp)
+                params_variant = dict(params)
+                params_variant["max_epochs"] = int(params_variant.get("max_epochs", 100) * 0.8)
+                grid[tier] = params
+                grid[f"{tier}_fast"] = params_variant
+        elif method == "harmony":
+            for tier in ["light", "standard", "high"]:
+                tier_key, params = self._select_harmony_params(n_cells, n_batches or 2, tier)
+                grid[tier_key] = params
+        elif method == "mnn":
+            for tier in ["light", "standard", "high"]:
+                tier_key, params = self._select_mnn_params(n_batches or 2, tier)
+                grid[tier_key] = params
+        elif method == "cca":
+            for tier in ["light", "standard", "high"]:
+                tier_key, params = self._select_cca_params(tier)
+                grid[tier_key] = params
+        elif method == "liger":
+            for tier in ["light", "standard", "high"]:
+                tier_key, params = self._select_liger_params(modality_label, tier)
+                grid[tier_key] = params
+        return grid
+
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
         inspection = state.get("inspection") or {}
         plan = state.get("plan") or {}
@@ -558,58 +726,27 @@ class TuningAgent(BaseAgent):
         chosen_params: Dict[str, str] = {}
         param_presets: Dict[str, Dict[str, Dict[str, Any]]] = {}
         compute_budget = dict(getattr(config, "COMPUTE_BUDGET", {}) or {})
-        debug_light = bool(state.get("quick_tuning"))
-        default_tier = state.get("preset_tier_default") or ("light" if debug_light else "standard")
 
         for modality, subplan in plan.items():
             insp = inspection.get(modality) or next(iter(inspection.values()), {})
-            n_cells = insp.get("n_cells")
-            n_batches = len(insp.get("batch_candidates") or []) or 1
             modality_label = insp.get("modality") or modality
 
             for method in (subplan.get("methods") or {}):
-                if method not in method_candidates or method in chosen_params:
+                canonical = canonicalize_method_name(method)
+                if canonical not in method_candidates:
                     continue
+                grid = self._build_param_grid(canonical, modality_label, insp)
+                if not grid:
+                    continue
+                param_presets[canonical] = grid
+                chosen_params[canonical] = next(iter(grid.keys()))
 
-                tier_key = default_tier
-                params: Dict[str, Any] = {}
-
-                if method == "scvi":
-                    tier_key, params = self._select_scvi_params(modality_label, n_cells, default_tier, insp)
-                elif method == "harmony":
-                    tier_key, params = self._select_harmony_params(n_cells, n_batches, default_tier)
-                elif method == "mnn":
-                    tier_key, params = self._select_mnn_params(n_batches, default_tier)
-                elif method == "cca":
-                    tier_key, params = self._select_cca_params(default_tier)
-                elif method == "liger":
-                    tier_key, params = self._select_liger_params(modality_label, default_tier)
-
-                chosen_params[method] = tier_key
-                param_presets[method] = {tier_key: params}
-
-        # TODO: multi-preset benchmarking and populating param_results with metrics
         state["chosen_params"] = chosen_params
         state["param_presets"] = param_presets
         state["param_results"] = {}
         state["compute_budget"] = compute_budget
 
-        # Merge presets into plan
-        for modality, subplan in plan.items():
-            methods_cfg = subplan.get("methods") or {}
-            merged_methods: Dict[str, Dict[str, Any]] = {}
-            for method, base_params in methods_cfg.items():
-                preset_name = chosen_params.get(method)
-                if preset_name:
-                    preset_values = param_presets.get(method, {}).get(preset_name, {}) or {}
-                    merged_methods[method] = {**(base_params or {}), **preset_values}
-                else:
-                    merged_methods[method] = base_params or {}
-            subplan["methods"] = merged_methods
-            plan[modality] = subplan
-
-        state["plan"] = plan
-        logger.info(f"[Tuning] Applied presets. chosen={chosen_params}")
+        logger.info(f"[Tuning] Prepared parameter grids: { {k: list(v.keys()) for k, v in param_presets.items()} }")
         return state
 # ==========================================
 # 2. Preprocess Agent (负责数据准备)
@@ -622,8 +759,8 @@ class PreprocessAgent(BaseAgent):
         plan = state.get("plan", {})
         data_path = state.get("data_path")
         benchmark_fraction = state.get("benchmark_fraction")
+        subset_filters = state.get("subset_filters") or {}
 
-        # Ensure containers exist and are dicts
         if not isinstance(state.get("data_hvg"), dict):
             state["data_hvg"] = {}
         if not isinstance(state.get("data_raw"), dict):
@@ -644,9 +781,36 @@ class PreprocessAgent(BaseAgent):
                 adata_hvg, adata_raw = OmicsTools.load_and_preprocess(
                     data_path,
                     original_batch_key=batch_key,
-                    modality=modality_param
+                    modality=modality_param,
                 )
-                # Subsample for benchmark mode
+
+                genes_keep = subset_filters.get("genes") or []
+                if genes_keep:
+                    keep_vars = [g for g in genes_keep if g in adata_hvg.var_names]
+                    if keep_vars:
+                        adata_hvg = adata_hvg[:, keep_vars].copy()
+                        if adata_raw is not None:
+                            adata_raw = adata_raw[:, keep_vars].copy()
+                        logger.info(f"[Preprocessor] Subset genes for {modality}: {len(keep_vars)} kept.")
+
+                celltypes_keep = subset_filters.get("celltypes") or []
+                if celltypes_keep:
+                    obs_cols = adata_hvg.obs.columns
+                    celltype_col = None
+                    for candidate in ["celltype", "cell_type", "cell_type_label"]:
+                        if candidate in obs_cols:
+                            celltype_col = candidate
+                            break
+                    if celltype_col:
+                        mask = adata_hvg.obs[celltype_col].astype(str).isin(celltypes_keep)
+                        if mask.any():
+                            adata_hvg = adata_hvg[mask].copy()
+                            if adata_raw is not None:
+                                adata_raw = adata_raw[adata_hvg.obs_names].copy()
+                            logger.info(
+                                f"[Preprocessor] Filtered {modality} to {mask.sum()} cells using cell types {celltypes_keep}."
+                            )
+
                 if benchmark_fraction is not None:
                     try:
                         frac = float(benchmark_fraction)
@@ -655,16 +819,17 @@ class PreprocessAgent(BaseAgent):
                     if not (0.0 < frac < 1.0):
                         raise ValueError(f"benchmark_fraction must be in (0, 1), got {frac}")
                     if adata_hvg.n_obs <= 10:
-                        raise ValueError(f"[Preprocessor] Too few cells ({adata_hvg.n_obs}) for benchmark subsampling.")
-                    else:
-                        n_cells = adata_hvg.n_obs
-                        n_keep = max(int(n_cells * frac), 10)
-                        idx = np.random.choice(n_cells, size=n_keep, replace=False)
-                        adata_hvg = adata_hvg[idx].copy()
-                        if adata_raw is not None:
-                            adata_raw = adata_raw[adata_hvg.obs_names].copy()
-                        logger.info(f"[Preprocessor] Subsampled {modality}: {n_cells} -> {n_keep} cells for benchmark.")
-                # HVG requirement
+                        raise ValueError(
+                            f"[Preprocessor] Too few cells ({adata_hvg.n_obs}) for benchmark subsampling."
+                        )
+                    n_cells = adata_hvg.n_obs
+                    n_keep = max(int(n_cells * frac), 10)
+                    idx = np.random.choice(n_cells, size=n_keep, replace=False)
+                    adata_hvg = adata_hvg[idx].copy()
+                    if adata_raw is not None:
+                        adata_raw = adata_raw[adata_hvg.obs_names].copy()
+                    logger.info(f"[Preprocessor] Subsampled {modality}: {n_cells} -> {n_keep} cells for benchmark.")
+
                 if adata_hvg.shape[1] < 200:
                     raise ValueError(f"[Preprocessor] {modality} has too few HVGs ({adata_hvg.shape[1]}).")
 
@@ -711,9 +876,13 @@ class IntegrationAgent(BaseAgent):
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
         plan = state.get("plan", {})
         run_all_methods_flag = bool(state.get("run_all_methods", False))
+        param_presets = state.get("param_presets") or {}
+        chosen_params = state.get("chosen_params") or {}
 
         if "results" not in state:
             state["results"] = {}
+        if "param_results" not in state:
+            state["param_results"] = {}
 
         adata_hvg_all = state.get("data_hvg") or {}
         adata_raw_all = state.get("data_raw") or {}
@@ -741,34 +910,65 @@ class IntegrationAgent(BaseAgent):
                 raise RuntimeError(f"No integration methods configured for modality '{modality}'")
 
             state["results"].setdefault(modality, {})
+            state["param_results"].setdefault(modality, {})
 
             for method_name, method_params in methods_cfg.items():
                 runner = INTEGRATION_METHODS.get(method_name)
                 if runner is None:
                     raise KeyError(f"Unknown integration method '{method_name}' for {modality}")
 
-                try:
-                    result_adata = runner(
-                        adata_hvg,
-                        adata_raw,
-                        batch_key=batch_key,
-                        **(method_params or {})
-                    )
+                presets = param_presets.get(method_name) or {"default": method_params or {}}
+                best_score = float("-inf")
+                best_name = None
+                best_result = None
+                preset_scores: Dict[str, float] = {}
 
-                    if result_adata is None:
-                        raise RuntimeError(f"Integration method '{method_name}' returned None for modality '{modality}'")
+                for preset_name, preset_params in presets.items():
+                    try:
+                        merged_params = {**(method_params or {}), **(preset_params or {})}
+                        result_adata = runner(
+                            adata_hvg,
+                            adata_raw,
+                            batch_key=batch_key,
+                            **merged_params,
+                        )
 
-                    embedding_key = f"X_{method_name}"
-                    if embedding_key not in result_adata.obsm:
-                        raise KeyError(f"Method '{method_name}' result missing expected embedding '{embedding_key}'")
+                        if result_adata is None:
+                            raise RuntimeError(
+                                f"Integration method '{method_name}' returned None for modality '{modality}'"
+                            )
 
-                    state["results"][modality][method_name] = result_adata
-                    logger.info(f"✅ [Integrator] {method_name} finished for {modality}")
+                        embedding_key = f"X_{method_name}"
+                        if embedding_key not in result_adata.obsm:
+                            raise KeyError(
+                                f"Method '{method_name}' result missing expected embedding '{embedding_key}'"
+                            )
 
-                except Exception as e:
-                    logger.error(f"🛑 [Integrator] Error running {method_name} on {modality}: {e}")
-                    state["error"] = str(e)
-                    raise
+                        emb = result_adata.obsm[embedding_key]
+                        score = calculate_graph_connectivity(emb, n_neighbors=15, n_cells=emb.shape[0])
+                        preset_scores[preset_name] = float(score)
+                        if score > best_score:
+                            best_score = score
+                            best_name = preset_name
+                            best_result = result_adata
+                    except Exception as e:
+                        logger.error(
+                            f"🛑 [Integrator] Error running {method_name} preset {preset_name} on {modality}: {e}"
+                        )
+                        state["error"] = str(e)
+                        raise
+
+                if best_result is None:
+                    raise RuntimeError(f"No successful preset for method '{method_name}' on modality '{modality}'")
+
+                state["results"][modality][method_name] = best_result
+                state["param_results"][modality][method_name] = preset_scores
+                chosen_params[method_name] = best_name or chosen_params.get(method_name)
+                logger.info(
+                    f"✅ [Integrator] {method_name} finished for {modality} with best preset={best_name} (score={best_score:.4f})"
+                )
+
+        state["chosen_params"] = chosen_params
 
         return state
 
@@ -834,6 +1034,18 @@ class EvaluationAgent(BaseAgent):
 
         eval_df = pd.DataFrame(records, columns=["modality", "method", "metric", "value"])
         state["evaluation"] = eval_df
+
+        method_scores: Dict[str, Dict[str, float]] = {}
+        best_methods: Dict[str, str] = {}
+        if not eval_df.empty:
+            for (modality, method), subdf in eval_df.groupby(["modality", "method"]):
+                method_scores.setdefault(modality, {})[method] = float(subdf["value"].mean())
+            for modality, scores in method_scores.items():
+                if scores:
+                    best_methods[modality] = max(scores, key=scores.get)
+
+        state["method_scores"] = method_scores
+        state["best_methods"] = best_methods
         return state
 
 # ==========================================
@@ -854,7 +1066,11 @@ class ReporterAgent(BaseAgent):
                     methods_fmt.append("cca (Seurat-CCA integration via Seurat package)")
                 else:
                     methods_fmt.append(m)
-            print(f"[{modality}] preprocess={subplan.get('preprocess', True)}, batch_key={subplan.get('batch_key')}, methods={methods_fmt}")
+            print(
+                f"[{modality}] preprocess={subplan.get('preprocess', True)}"
+                f" via {subplan.get('preprocess_tool', 'auto')}, batch_key={subplan.get('batch_key')},"
+                f" methods={methods_fmt}"
+            )
 
     @staticmethod
     def _print_results(results: Dict[str, Any]):
@@ -893,6 +1109,8 @@ class ReporterAgent(BaseAgent):
 
         chosen_params = state.get("chosen_params") or {}
         param_presets = state.get("param_presets") or {}
+        best_methods = state.get("best_methods") or {}
+        subset_filters = state.get("subset_filters") or {}
         plan = state.get("plan") or {}
         report_entries: Dict[str, Any] = {}
         for modality in plan.keys():
@@ -915,4 +1133,10 @@ class ReporterAgent(BaseAgent):
             print(f"Hyperparameter presets used: {summary_line}")
         else:
             print("Hyperparameter presets used: default settings")
+
+        if subset_filters.get("genes") or subset_filters.get("celltypes"):
+            print(f"Subset filters applied: {subset_filters}")
+        if best_methods:
+            readable = ", ".join(f"{mod}:{method}" for mod, method in best_methods.items())
+            print(f"Best-performing methods per modality: {readable}")
         return state

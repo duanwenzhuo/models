@@ -1,6 +1,8 @@
 # main.py
 import os
+import sys
 import config
+from tools import build_result_filename
 from workflow import create_workflow_app
 
 
@@ -12,13 +14,20 @@ def main():
     print(f"Model: {config.LLM_MODEL}")
 
     # 1. Prepare initial input
-    data_path = os.path.join("data/small_atac_gene_activity/small_atac_gene_activity.h5ad")
+    default_data = os.path.join("data/small_atac_gene_activity/small_atac_gene_activity.h5ad")
+    default_task = (
+        "Load the pancreas data. I want to perform scVI and Harmony integration, "
+        "and automatically detect the appropriate batch column from the metadata."
+    )
+    if sys.stdin.isatty():
+        user_task = input("Enter omics task description (press Enter for default): ").strip() or default_task
+        data_path = input(f"Path to AnnData file [default: {default_data}]: ").strip() or default_data
+    else:
+        user_task = default_task
+        data_path = default_data
 
     initial_state = {
-        "user_intent": (
-            "Load the pancreas data. I want to perform scVI and Harmony integration, "
-            "and automatically detect the appropriate batch column from the metadata."
-        ),
+        "user_intent": user_task,
         "data_path": data_path,
         "plan": {},
         "data_hvg": {},
@@ -72,7 +81,7 @@ def main():
                 if embedding_keys:
                     print(f"   Embedding keys: {embedding_keys}")
 
-                out_name = f"integrated_{modality}_{method}.h5ad"
+                out_name = build_result_filename(data_path, modality, method, initial_state.get("benchmark_fraction"))
                 out_path = os.path.join(config.RESULTS_DIR, out_name)
                 adata.write(out_path)
                 print(f"   Saved to: {out_path}")

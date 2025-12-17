@@ -49,6 +49,10 @@ class AgentState(TypedDict):
     param_presets: Optional[Dict[str, Dict[str, Dict[str, Any]]]]
     chosen_params: Optional[Dict[str, str]]
     param_results: Optional[Dict[str, Any]]
+    method_scores: Optional[Dict[str, Dict[str, float]]]
+    best_methods: Optional[Dict[str, str]]
+    modalities: Optional[List[str]]
+    subset_filters: Optional[Dict[str, Any]]
     compute_budget: Optional[Dict[str, Any]]
 
     # 执行日志/消息历史 (可选)
