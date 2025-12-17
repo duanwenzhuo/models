@@ -572,31 +572,6 @@ class PlannerAgent(BaseAgent):
         state["subset_config"] = subset_prefs
         preprocess_recos: Dict[str, Any] = {}
 
-        # prompt
-        system_prompt = (
-            "You are a bioinformatics pipeline planner.\n"
-            "Output a concise JSON plan only. Example: {\"RNA\": {\"preprocess\": true, \"methods\": [\"scvi\",\"harmony\"]}}\n"
-            "Include one entry per modality you see, with keys preprocess (true/false) and methods (list of allowed names).\n"
-            "Do not add explanations."
-        )
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_intent}
-        ]
-        resp = client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-            temperature=0.0
-        )
-        try:
-            content = resp.choices[0].message.content if resp and resp.choices else ""
-            cleaned = content.replace("```json", "").replace("```", "").strip()
-            m = re.search(r"\{.*\}", cleaned, flags=re.S)
-            raw_plan = json.loads(m.group(0) if m else cleaned) if cleaned else {}
-        except Exception:
-            raw_plan = {}
-
         ALL = ["scvi", "harmony", "mnn", "cca", "liger"]
         modalities_for_plan = list(inspection.keys()) or detected_modalities or ["RNA"]
 
