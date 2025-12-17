@@ -62,6 +62,89 @@ def sanitize_filename(filename: str) -> str:
 
 
 # ==========================================
+# Task parsing helpers
+# ==========================================
+TASK_MODALITY_KEYWORDS = {
+    "scrna": "RNA",
+    "rna-seq": "RNA",
+    "sc-rna": "RNA",
+    "rna": "RNA",
+    "atac": "ATAC_gene_activity",
+    "atac-seq": "ATAC_gene_activity",
+    "multiome": "ATAC_gene_activity",
+    "spatial": "spatial",
+    "visium": "spatial",
+    "slide-seq": "spatial",
+    "adt": "ADT",
+}
+
+PREPROCESS_KEYWORDS = {
+    "harmony": "harmony",
+    "mnn": "mnn",
+    "seurat": "seurat",
+    "cca": "cca",
+    "liger": "liger",
+    "scvi": "scvi",
+}
+
+
+class TaskIntentParser:
+    """Lightweight intent parser to detect modality, preprocessing and subsets."""
+
+    def __init__(self, intent: str):
+        self.intent = intent or ""
+        self.intent_lower = self.intent.lower()
+
+    def detect_modalities(self) -> List[str]:
+        matches: List[str] = []
+        for key, modality in TASK_MODALITY_KEYWORDS.items():
+            if key in self.intent_lower:
+                matches.append(modality)
+        if not matches:
+            matches.append("RNA")
+        return sorted(set(matches))
+
+    def infer_preprocessing(self, modality: str) -> Dict[str, Any]:
+        need_preprocess = True
+        if any(k in self.intent_lower for k in ["raw already", "preprocessed", "normalized"]):
+            need_preprocess = False
+
+        suggested = None
+        for key, name in PREPROCESS_KEYWORDS.items():
+            if key in self.intent_lower:
+                suggested = name
+                break
+
+        if suggested is None:
+            if "batch" in self.intent_lower or "batch effect" in self.intent_lower:
+                suggested = "harmony"
+            elif "integration" in self.intent_lower:
+                suggested = "scvi" if modality.upper() == "RNA" else "harmony"
+
+        return {"preprocess": need_preprocess, "preferred_method": suggested}
+
+    def extract_subset_preferences(self) -> Dict[str, List[str]]:
+        subset: Dict[str, List[str]] = {"genes": [], "celltypes": [], "batches": []}
+
+        gene_match = re.search(r"genes?[:=]\s*([\w,; ]+)", self.intent_lower)
+        if gene_match:
+            genes = [g.strip().upper() for g in re.split(r"[,;]", gene_match.group(1)) if g.strip()]
+            subset["genes"] = genes
+
+        celltype_match = re.search(r"cell(types?)?[:=]\s*([\w,; ]+)", self.intent_lower)
+        if celltype_match:
+            celltypes = [c.strip() for c in re.split(r"[,;]", celltype_match.group(2)) if c.strip()]
+            subset["celltypes"] = celltypes
+
+        batch_match = re.search(r"batches?[:=]\s*([\w,; ]+)", self.intent_lower)
+        if batch_match:
+            batches = [b.strip() for b in re.split(r"[,;]", batch_match.group(1)) if b.strip()]
+            subset["batches"] = batches
+
+        return subset
+
+
+# ==========================================
 # Base Agent
 # ==========================================
 class BaseAgent:
@@ -482,6 +565,13 @@ class PlannerAgent(BaseAgent):
         inspection = state.get("inspection", {})
         logger.info(f"🤖 [Planner] Analyzing request: {user_intent}")
 
+        parser = TaskIntentParser(user_intent)
+        detected_modalities = parser.detect_modalities()
+        subset_prefs = parser.extract_subset_preferences()
+        state["task_modalities"] = detected_modalities
+        state["subset_config"] = subset_prefs
+        preprocess_recos: Dict[str, Any] = {}
+
         # prompt
         system_prompt = (
             "You are a bioinformatics pipeline planner.\n"
@@ -508,13 +598,23 @@ class PlannerAgent(BaseAgent):
             raw_plan = {}
 
         ALL = ["scvi", "harmony", "mnn", "cca", "liger"]
-        raw_plan = {
-            m: {
-                "preprocess": bool(raw_plan.get(m, {}).get("preprocess", True)),
-                "methods": ALL
+        modalities_for_plan = list(inspection.keys()) or detected_modalities or ["RNA"]
+
+        raw_plan = {}
+        for modality in modalities_for_plan:
+            reco = parser.infer_preprocessing(modality)
+            preprocess_recos[modality] = reco
+            methods = ALL.copy()
+            preferred = reco.get("preferred_method")
+            if preferred and preferred in ALL:
+                methods = [preferred] + [m for m in methods if m != preferred]
+            raw_plan[modality] = {
+                "preprocess": bool(reco.get("preprocess", True)),
+                "methods": methods,
+                "modality": modality,
             }
-            for m in (inspection.keys() or ["RNA"])
-        }
+
+        state["preprocess_recommendations"] = preprocess_recos
         plan = self._validate_and_normalize_plan(raw_plan, inspection)
 
         inspection_info = state.get("inspection") or {}
@@ -733,10 +833,53 @@ class PreprocessAgent(BaseAgent):
     def __init__(self):
         super().__init__("Preprocessor")
 
+    def _apply_subsets(self, adata_hvg: Any, adata_raw: Any, subset_cfg: Dict[str, Any], modality: str):
+        if not subset_cfg:
+            return adata_hvg, adata_raw
+
+        result_hvg = adata_hvg
+        result_raw = adata_raw
+
+        genes = subset_cfg.get("genes") or []
+        if genes:
+            upper_map = {g.upper(): g for g in result_hvg.var_names}
+            keep_genes = [upper_map[g] for g in genes if g in upper_map]
+            if keep_genes:
+                result_hvg = result_hvg[:, keep_genes].copy()
+                if result_raw is not None:
+                    result_raw = result_raw[:, keep_genes].copy()
+                logger.info(f"[Preprocessor] {modality}: subset to {len(keep_genes)} genes from intent")
+
+        celltypes = subset_cfg.get("celltypes") or []
+        if celltypes:
+            candidate_cols = [c for c in result_hvg.obs.columns if "cell" in c.lower() or "type" in c.lower()]
+            matched_col = candidate_cols[0] if candidate_cols else None
+            if matched_col:
+                mask = result_hvg.obs[matched_col].astype(str).isin(celltypes)
+                if mask.sum() > 0:
+                    result_hvg = result_hvg[mask].copy()
+                    if result_raw is not None:
+                        result_raw = result_raw[result_hvg.obs_names].copy()
+                    logger.info(
+                        f"[Preprocessor] {modality}: subset to {mask.sum()} cells matching {celltypes} via {matched_col}"
+                    )
+
+        batches = subset_cfg.get("batches") or []
+        if batches and "batch" in result_hvg.obs:
+            mask = result_hvg.obs["batch"].astype(str).isin(batches)
+            if mask.sum() > 0:
+                result_hvg = result_hvg[mask].copy()
+                if result_raw is not None:
+                    result_raw = result_raw[result_hvg.obs_names].copy()
+                logger.info(f"[Preprocessor] {modality}: subset to batches {batches}")
+
+        return result_hvg, result_raw
+
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
         plan = state.get("plan", {})
         data_path = state.get("data_path")
         benchmark_fraction = state.get("benchmark_fraction")
+        subset_cfg = state.get("subset_config") or {}
 
         # Ensure containers exist and are dicts
         if not isinstance(state.get("data_hvg"), dict):
@@ -753,6 +896,7 @@ class PreprocessAgent(BaseAgent):
             preprocess_flag = subplan.get("preprocess", True)
             adata_existing = state["data_hvg"].get(modality)
             modality_param = subplan.get("modality", modality)
+            reco = (state.get("preprocess_recommendations") or {}).get(modality, {})
 
             # Store a sanitized preprocessing output filename to avoid path issues
             try:
@@ -768,12 +912,17 @@ class PreprocessAgent(BaseAgent):
                 continue
 
             logger.info(f"🧪 [Preprocessor] Processing {modality} data...")
+            if reco.get("preferred_method"):
+                logger.info(
+                    f"[Preprocessor] Intent suggested preprocessing helper: {reco.get('preferred_method')} (need_preprocess={preprocess_flag})"
+                )
             try:
                 adata_hvg, adata_raw = OmicsTools.load_and_preprocess(
                     data_path,
                     original_batch_key=batch_key,
                     modality=modality_param
                 )
+                adata_hvg, adata_raw = self._apply_subsets(adata_hvg, adata_raw, subset_cfg.get(modality, subset_cfg), modality)
                 state["data_hvg_full"][modality] = adata_hvg.copy()
                 state["data_raw_full"][modality] = adata_raw.copy() if adata_raw is not None else None
                 # Subsample for benchmark mode
@@ -846,6 +995,7 @@ class IntegrationAgent(BaseAgent):
         state.setdefault("results", {})
         state.setdefault("param_search_results", [])
         state.setdefault("best_params", {})
+        state.setdefault("best_param_tiers", {})
         state.setdefault("best_rank", {})
         state.setdefault("method_errors", {})
         state.setdefault("final_selection", {})
@@ -871,6 +1021,7 @@ class IntegrationAgent(BaseAgent):
             state["results"].setdefault(modality, {})
             state["method_errors"].setdefault(modality, {})
             state["best_params"][modality] = {}
+            state["best_param_tiers"][modality] = {}
             state["best_rank"][modality] = []
 
             if subplan.get("methods"):
@@ -897,6 +1048,7 @@ class IntegrationAgent(BaseAgent):
 
                 best_score = None
                 best_params_for_method: Dict[str, Any] | None = None
+                best_tier_name: Optional[str] = None
 
                 for tier, params in candidates:
                     record = {
@@ -953,9 +1105,11 @@ class IntegrationAgent(BaseAgent):
                     if (best_score is None) or (score > best_score):
                         best_score = score
                         best_params_for_method = params
+                        best_tier_name = tier
 
                 if best_params_for_method is not None:
                     state["best_params"][modality][method_name] = best_params_for_method
+                    state["best_param_tiers"][modality][method_name] = best_tier_name
                     state["best_rank"][modality].append((method_name, best_score if best_score is not None else 0.0))
                 else:
                     state["method_errors"][modality][method_name] = "No valid params in benchmark"
@@ -1182,6 +1336,15 @@ class ReporterAgent(BaseAgent):
             print(f"[{modality}] preprocess={subplan.get('preprocess', True)}, batch_key={subplan.get('batch_key')}, methods={methods_fmt}")
 
     @staticmethod
+    def _print_task_profile(state: Dict[str, Any]):
+        modalities = state.get("task_modalities") or list((state.get("inspection") or {}).keys())
+        subset_cfg = state.get("subset_config") or {}
+        print("\n--- Task Understanding ---")
+        print(f"Detected modalities: {modalities}")
+        if subset_cfg:
+            print(f"Subset preferences: {subset_cfg}")
+
+    @staticmethod
     def _print_results(results: Dict[str, Any]):
         print("\n--- Results Overview ---")
         if not results:
@@ -1204,6 +1367,33 @@ class ReporterAgent(BaseAgent):
             method = info.get("method")
             score = info.get("score")
             print(f"[{modality}] method={method}, score={score}, params={info.get('params')}")
+
+    @staticmethod
+    def _print_method_comparison(evaluation: Optional[Dict[str, Any]]):
+        if not isinstance(evaluation, dict):
+            return
+        final_scores = evaluation.get("final_scores") or {}
+        if not final_scores:
+            return
+        print("\n--- Method Comparison ---")
+        for modality, entries in final_scores.items():
+            if not entries:
+                continue
+            best = entries[0]
+            print(
+                f"[{modality}] Top method: {best.get('method')} (score={best.get('score'):.4f}). "
+                f"Other tested: {[e.get('method') for e in entries]}"
+            )
+
+    @staticmethod
+    def _print_param_choices(state: Dict[str, Any]):
+        tiers = state.get("best_param_tiers") or {}
+        if not tiers:
+            return
+        print("\n--- Best Parameter Tiers ---")
+        for modality, method_map in tiers.items():
+            for method, tier in (method_map or {}).items():
+                print(f"[{modality}] {method}: {tier}")
 
     @staticmethod
     def _print_evaluation(eval_obj: Optional[Any]):
@@ -1238,10 +1428,13 @@ class ReporterAgent(BaseAgent):
         print("\n===== OMICS INTEGRATION REPORT =====")
         if state.get("error"):
             print(f"ERROR: {state.get('error')}")
+        self._print_task_profile(state)
         self._print_plan(state.get("plan") or {})
         self._print_results(state.get("results") or {})
         self._print_final_selection(state.get("final_selection") or {})
         self._print_evaluation(state.get("evaluation"))
+        self._print_method_comparison(state.get("evaluation"))
+        self._print_param_choices(state)
 
         chosen_params = state.get("chosen_params") or {}
         param_presets = state.get("param_presets") or {}

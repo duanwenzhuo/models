@@ -1,25 +1,47 @@
 # main.py
-import os
+import argparse
+
 import config
+from tools import slugify_dataset_name
 from workflow import create_workflow_app
 
 
 def main():
+    parser = argparse.ArgumentParser(description="LLM-based Multi-Agent Omics Integration")
+    parser.add_argument("--data-path", default="data/small_atac_gene_activity/small_atac_gene_activity.h5ad")
+    parser.add_argument("--task", default=(
+        "Load the data and perform integration while automatically detecting the batch column."
+    ))
+    parser.add_argument("--subset-genes", help="Comma separated gene list", default="")
+    parser.add_argument("--subset-celltypes", help="Comma separated cell type list", default="")
+    parser.add_argument("--subset-batches", help="Comma separated batch ids", default="")
+    parser.add_argument("--benchmark-fraction", type=float, default=0.2)
+    parser.add_argument("--run-all-methods", action="store_true", help="Force running all integration methods")
+    parser.add_argument("--no-search-params", action="store_true", help="Disable parameter search")
+    parser.add_argument("--allow-multi-top", action="store_true", help="Keep all tuned methods instead of top1")
+    args = parser.parse_args()
+
     print("==================================================")
     print("LLM-based Multi-Agent Omics Integration System")
     print("==================================================")
     print(f"Data Directory: {config.DATA_DIR}")
     print(f"Model: {config.LLM_MODEL}")
+    print(f"User task: {args.task}")
+
+    subset_config = {
+        "genes": [g.strip().upper() for g in args.subset_genes.split(",") if g.strip()],
+        "celltypes": [c.strip() for c in args.subset_celltypes.split(",") if c.strip()],
+        "batches": [b.strip() for b in args.subset_batches.split(",") if b.strip()],
+    }
+
+    dataset_slug = slugify_dataset_name(args.data_path)
+    log_path = config.configure_logging(dataset_slug)
+    print(f"Log file: {log_path}")
 
     # 1. Prepare initial input
-    data_path = os.path.join("data/small_atac_gene_activity/small_atac_gene_activity.h5ad")
-
     initial_state = {
-        "user_intent": (
-            "Load the data. I want to perform integration, "
-            "and automatically detect the appropriate batch column from the metadata."
-        ),
-        "data_path": data_path,
+        "user_intent": args.task,
+        "data_path": args.data_path,
         "plan": {},
         "data_hvg": {},
         "data_raw": {},
@@ -27,14 +49,17 @@ def main():
         "results": {},
         "evaluation": None,
         "report_path": None,
-        "benchmark_fraction": 0.2,
-        "run_all_methods": True,
-        "search_params": True,
-        "top1_only": True,
+        "benchmark_fraction": args.benchmark_fraction,
+        "run_all_methods": bool(args.run_all_methods),
+        "search_params": not args.no_search_params,
+        "top1_only": not args.allow_multi_top,
         "data_hvg_full": {},
         "data_raw_full": {},
         "logs": [],
         "error": None,
+        "subset_config": subset_config,
+        "task_modalities": [],
+        "preprocess_recommendations": {},
     }
 
     # 2. Create and run workflow

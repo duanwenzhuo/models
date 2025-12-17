@@ -26,6 +26,9 @@ class AgentState(TypedDict):
     # 输入信息
     user_intent: str
     data_path: str
+    task_modalities: Optional[List[str]]
+    subset_config: Optional[Dict[str, Any]]
+    preprocess_recommendations: Optional[Dict[str, Any]]
 
     # 规划结果
     plan: Dict[str, Any]
@@ -52,6 +55,7 @@ class AgentState(TypedDict):
     compute_budget: Optional[Dict[str, Any]]
     param_search_results: Optional[List[Dict[str, Any]]]
     best_params: Optional[Dict[str, Any]]
+    best_param_tiers: Optional[Dict[str, Any]]
     best_rank: Optional[Dict[str, Any]]
     method_errors: Optional[Dict[str, Any]]
     final_selection: Optional[Dict[str, Any]]
