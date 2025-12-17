@@ -1,9 +1,11 @@
 import logging
 import os
+import logging
+import os
 from typing import Any, Dict
 
 # API configuration
-OPENAI_API_KEY = 
+OPENAI_API_KEY = ""
 
 
 
