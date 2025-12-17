@@ -1080,6 +1080,32 @@ class EvaluationAgent(BaseAgent):
         base = total / weight_sum
         return float(base * np.sqrt(coverage)), coverage
 
+    def _derive_group_weights(
+        self, group_to_metrics: Dict[str, List[str]], overrides: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, float]:
+        weights: Dict[str, float] = {}
+        if overrides:
+            for key, val in overrides.items():
+                try:
+                    w = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if w <= 0:
+                    continue
+                weights[key.lower()] = w
+        if not weights:
+            for group_key, metric_ids in group_to_metrics.items():
+                weights[group_key] = sum(
+                    float(METRIC_SPECS.get(mid, {}).get("weight", 1.0)) for mid in metric_ids
+                )
+        positive_total = sum(w for w in weights.values() if w > 0)
+        if positive_total <= 0:
+            if not group_to_metrics:
+                return {}
+            uniform = 1.0 / len(group_to_metrics)
+            return {g: uniform for g in group_to_metrics.keys()}
+        return {g: w / positive_total for g, w in weights.items() if w > 0}
+
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
         results = state.get("results") or {}
         inspection = state.get("inspection") or {}
@@ -1087,7 +1113,9 @@ class EvaluationAgent(BaseAgent):
 
         raw_scores: Dict[str, Dict[str, Dict[str, Optional[float]]]] = defaultdict(lambda: defaultdict(dict))
         normalized_scores: Dict[str, Dict[str, Dict[str, Optional[float]]]] = defaultdict(lambda: defaultdict(dict))
-        group_scores: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(lambda: defaultdict(dict))
+        group_scores: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = defaultdict(
+            lambda: defaultdict(dict)
+        )
         final_scores: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
         # Build group mapping from METRIC_SPECS
@@ -1096,6 +1124,9 @@ class EvaluationAgent(BaseAgent):
             group = (spec.get("group") or "").lower()
             if group:
                 group_to_metrics[group].append(mid)
+
+        group_weight_overrides = getattr(config, "EVALUATION_GROUP_WEIGHTS", None)
+        group_weights = self._derive_group_weights(group_to_metrics, group_weight_overrides)
 
         # Stage 1: collect raw scores
         for modality, methods in results.items():
@@ -1134,21 +1165,38 @@ class EvaluationAgent(BaseAgent):
                 group_scores[modality][method_name] = {}
                 for group_key, metric_list in group_to_metrics.items():
                     agg, _coverage = self._aggregate_group(metric_list, metrics)
-                    group_scores[modality][method_name][group_key] = agg
+                    group_scores[modality][method_name][group_key] = {
+                        "score": agg,
+                        "coverage": _coverage,
+                    }
 
         # Stage 4: final score per modality
         for modality, methods in group_scores.items():
             for method_name, groups in methods.items():
-                bio = groups.get("bio_label", 0.0)
-                batch = groups.get("batch", 0.0)
-                bio_free = groups.get("bio_label_free", 0.0)
-                cross = groups.get("cross_modal", 0.0)
-                score = 0.6 * bio + 0.4 * batch + 0.0 * bio_free + 0.0 * cross
+                contributions: Dict[str, Any] = {}
+                weighted_sum = 0.0
+                effective_weight_sum = 0.0
+                for group_key, group_info in groups.items():
+                    base_weight = group_weights.get(group_key, 0.0)
+                    group_score = float(group_info.get("score", 0.0))
+                    coverage = float(group_info.get("coverage", 0.0))
+                    effective_weight = base_weight * coverage
+                    contribution = group_score * effective_weight
+                    weighted_sum += contribution
+                    effective_weight_sum += effective_weight
+                    contributions[group_key] = {
+                        "score": group_score,
+                        "coverage": coverage,
+                        "weight": base_weight,
+                        "effective_weight": effective_weight,
+                        "contribution": contribution,
+                    }
+                score = weighted_sum / effective_weight_sum if effective_weight_sum > 0 else 0.0
                 final_scores[modality].append(
                     {
                         "method": method_name,
                         "score": score,
-                        "groups": groups,
+                        "groups": contributions,
                     }
                 )
             final_scores[modality] = sorted(final_scores[modality], key=lambda x: x["score"], reverse=True)
@@ -1158,6 +1206,7 @@ class EvaluationAgent(BaseAgent):
             "normalized": normalized_scores,
             "group_scores": group_scores,
             "final_scores": final_scores,
+            "group_weights": group_weights,
         }
         return state
 
