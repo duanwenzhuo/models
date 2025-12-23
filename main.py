@@ -8,7 +8,8 @@ from workflow import create_workflow_app
 
 def main():
     parser = argparse.ArgumentParser(description="LLM-based Multi-Agent Omics Integration")
-    parser.add_argument("--data-path", default="data/small_atac_gene_activity/small_atac_gene_activity.h5ad")
+    parser.add_argument("--dataset", default="", help="Dataset folder name under DATA_DIR (e.g. Lung_atlas_public)")
+    parser.add_argument("--data-path", default="", help="Explicit path to .h5ad (overrides --dataset)")
     parser.add_argument("--task", default=(
         "Load the data and perform integration while automatically detecting the batch column."
     ))
@@ -21,12 +22,29 @@ def main():
     parser.add_argument("--allow-multi-top", action="store_true", help="Keep all tuned methods instead of top1")
     args = parser.parse_args()
 
+    # Resolve data_path:
+    # Priority: --data-path > --dataset > (error)
+    data_path = args.data_path.strip().strip('"').strip("'")
+    dataset = args.dataset.strip()
+
+    if not data_path:
+        if not dataset:
+            raise ValueError("You must provide either --data-path or --dataset")
+        data_path = os.path.join(config.DATA_DIR, dataset, f"{dataset}.h5ad")
+
+    # Normalize to absolute path for clarity/logging
+    data_path = os.path.abspath(data_path)
+
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Data file not found: {data_path}")
+
     print("==================================================")
     print("LLM-based Multi-Agent Omics Integration System")
     print("==================================================")
     print(f"Data Directory: {config.DATA_DIR}")
     print(f"Model: {config.LLM_MODEL}")
     print(f"User task: {args.task}")
+    print(f"Data Path: {data_path}")
 
     subset_config = {
         "genes": [g.strip().upper() for g in args.subset_genes.split(",") if g.strip()],
@@ -34,14 +52,14 @@ def main():
         "batches": [b.strip() for b in args.subset_batches.split(",") if b.strip()],
     }
 
-    dataset_slug = slugify_dataset_name(args.data_path)
+    dataset_slug = slugify_dataset_name(data_path)
     log_path = config.configure_logging(dataset_slug)
     print(f"Log file: {log_path}")
 
     # 1. Prepare initial input
     initial_state = {
         "user_intent": args.task,
-        "data_path": args.data_path,
+        "data_path": data_path,
         "plan": {},
         "data_hvg": {},
         "data_raw": {},
