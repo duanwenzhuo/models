@@ -5,8 +5,7 @@ import os
 from typing import Any, Dict
 
 # API configuration
-OPENAI_API_KEY = ""
-
+OPENAI_API_KEY = "sk-L1TUuj5pxxyBbg1aNiM2t5fQGdbhAOmJtgVufoXiek3KZLnJ"
 
 
 OPENAI_BASE_URL = "https://api.openai.com/v1"
