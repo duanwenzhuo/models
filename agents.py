@@ -408,6 +408,221 @@ class InspectionAgent(BaseAgent):
         candidates.sort(key=lambda x: x["score"], reverse=True)
         return candidates[:5]
 
+    @staticmethod
+    def _sample_dense_values(matrix: Any, max_samples: int = 50000) -> np.ndarray:
+        if matrix is None:
+            return np.array([])
+        try:
+            if sp.issparse(matrix):
+                data = matrix.data
+            else:
+                data = np.asarray(matrix)
+                if data.ndim > 1:
+                    data = data.ravel()
+            if data.size == 0:
+                return np.array([])
+            if data.size > max_samples:
+                idx = np.random.choice(data.size, size=max_samples, replace=False)
+                return data[idx]
+            return data
+        except Exception:
+            return np.array([])
+
+    def _matrix_fingerprint(self, data: Any) -> Dict[str, Any]:
+        values = self._sample_dense_values(data)
+        if values.size == 0:
+            return {
+                "value_min": None,
+                "value_max": None,
+                "q01": None,
+                "q50": None,
+                "q99": None,
+                "neg_rate": None,
+                "integer_fraction": None,
+                "sparsity": None,
+                "looks_like_counts": False,
+                "looks_like_log1p": False,
+                "looks_scaled": False,
+            }
+
+        quantiles = np.quantile(values, [0.01, 0.5, 0.99])
+        neg_rate = float(np.mean(values < 0))
+        integer_fraction = float(np.mean(np.isclose(values, np.round(values))))
+        sparsity = None
+        if sp.issparse(data):
+            total = data.shape[0] * data.shape[1]
+            sparsity = float(data.nnz / total) if total > 0 else None
+
+        looks_like_counts = bool(
+            (quantiles[2] is not None)
+            and (quantiles[2] > 20)
+            and integer_fraction > 0.8
+            and neg_rate < 0.01
+        )
+        looks_like_log1p = bool(
+            (quantiles[2] is not None)
+            and (quantiles[2] < 30)
+            and integer_fraction < 0.8
+            and neg_rate < 0.05
+        )
+        looks_scaled = bool(neg_rate > 0.05 or (abs(float(np.mean(values))) < 1 and np.std(values) < 5))
+
+        return {
+            "value_min": float(np.min(values)),
+            "value_max": float(np.max(values)),
+            "q01": float(quantiles[0]),
+            "q50": float(quantiles[1]),
+            "q99": float(quantiles[2]),
+            "neg_rate": neg_rate,
+            "integer_fraction": integer_fraction,
+            "sparsity": sparsity,
+            "looks_like_counts": looks_like_counts,
+            "looks_like_log1p": looks_like_log1p,
+            "looks_scaled": looks_scaled,
+        }
+
+    def _profile_layers(self, adata: AnnData) -> Dict[str, Any]:
+        layers_profile: Dict[str, Any] = {}
+        if hasattr(adata, "layers") and adata.layers:
+            for layer_name, arr in adata.layers.items():
+                layers_profile[layer_name] = self._matrix_fingerprint(arr)
+        return layers_profile
+
+    def _profile_obs(self, adata: AnnData) -> Dict[str, Any]:
+        obs_profile: Dict[str, Any] = {}
+        n_cells = adata.n_obs
+        for col in adata.obs.columns:
+            series = adata.obs[col]
+            missing_rate = float(series.isna().mean()) if hasattr(series, "isna") else 0.0
+            n_unique = int(series.nunique(dropna=True)) if hasattr(series, "nunique") else 0
+            top_levels = (
+                series.value_counts(dropna=True).head(5).to_dict()
+                if hasattr(series, "value_counts")
+                else {}
+            )
+            looks_like_id = n_unique >= max(2, int(0.9 * n_cells))
+            obs_profile[col] = {
+                "dtype": str(series.dtype),
+                "missing_rate": missing_rate,
+                "n_unique": n_unique,
+                "top_levels": top_levels,
+                "looks_like_id": looks_like_id,
+            }
+        return obs_profile
+
+    def _profile_var(self, adata: AnnData) -> Dict[str, Any]:
+        var_profile: Dict[str, Any] = {}
+        var_names = adata.var_names.astype(str)
+        atac_like = bool(np.mean([":" in v or "-" in v for v in var_names[: min(len(var_names), 2000)]]) > 0.3)
+        mt_ratio = float(np.mean([v.startswith("MT-") for v in var_names[: min(len(var_names), 5000)]]))
+        var_profile["var_name_prefix"] = {
+            "atac_peak_like": atac_like,
+            "mt_prefix_ratio": mt_ratio,
+        }
+        return var_profile
+
+    def _build_profile(self, adata: AnnData) -> Dict[str, Any]:
+        X = adata.X
+        primary_fp = self._matrix_fingerprint(X)
+        layers_fp = self._profile_layers(adata)
+        primary_layer = None
+        for candidate in ["counts", "raw", "activity"]:
+            if candidate in layers_fp:
+                primary_layer = candidate
+                primary_fp = layers_fp[candidate]
+                break
+        profile = {
+            "matrix": primary_fp,
+            "layers": layers_fp,
+            "primary_layer": primary_layer or "X",
+            "library_size": {},
+            "detected_genes_per_cell": {},
+            "obs": self._profile_obs(adata),
+            "var": self._profile_var(adata),
+        }
+
+        try:
+            libsize = np.array(adata.X.sum(axis=1)).ravel()
+            profile["library_size"] = {
+                "mean": float(np.mean(libsize)),
+                "median": float(np.median(libsize)),
+                "q99": float(np.quantile(libsize, 0.99)),
+            }
+            detected = np.array((adata.X > 0).sum(axis=1)).ravel()
+            profile["detected_genes_per_cell"] = {
+                "mean": float(np.mean(detected)),
+                "median": float(np.median(detected)),
+                "q99": float(np.quantile(detected, 0.99)),
+            }
+        except Exception:
+            pass
+
+        return profile
+
+    def _generate_policy_from_llm(self, profile: Dict[str, Any], modality: str, user_intent: str) -> Dict[str, Any]:
+        system_prompt = (
+            "You are a cautious bioinformatics assistant. Given a structured AnnData profile, "
+            "propose a preprocessing recipe. Only return JSON with fields primary_layer, preprocess_needed, "
+            "steps, skip_if_present, warnings, confidence. Steps should be a list of objects with 'name' and 'params'."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"Modality: {modality}\nProfile: {json.dumps(profile)[:6000]}\n"
+                    f"User intent: {user_intent}\nReturn JSON only."
+                ),
+            },
+        ]
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                temperature=0.0,
+            )
+            content = resp.choices[0].message.content.strip()
+            cleaned = content.replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception as e:
+            logger.error(f"[Inspection] LLM policy generation failed: {e}")
+        return {}
+
+    def _rank_batch_candidates(self, adata: AnnData) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        n_cells = adata.n_obs
+        keywords = ["batch", "donor", "sample", "library", "tech", "technology", "lane", "dataset", "origin", "replicate"]
+        exclude_tokens = ["cell", "barcode", "id", "index"]
+        for col in adata.obs.columns:
+            if not isinstance(col, str):
+                continue
+            col_lower = col.lower()
+            if any(tok in col_lower for tok in exclude_tokens):
+                continue
+            series = adata.obs[col]
+            missing_rate = float(series.isna().mean()) if hasattr(series, "isna") else 0.0
+            n_unique = int(series.nunique(dropna=True)) if hasattr(series, "nunique") else 0
+            if n_unique < 2 or n_unique > min(200, int(0.2 * max(1, n_cells))):
+                continue
+            if missing_rate >= 0.2:
+                continue
+            score = 1.0
+            if series.dtype == "category" or str(series.dtype).startswith("object"):
+                score += 0.5
+            if any(k in col_lower for k in keywords):
+                score += 1.0
+            candidates.append({
+                "name": col,
+                "score": score,
+                "n_unique": n_unique,
+                "missing_rate": missing_rate,
+                "top_levels": series.value_counts(dropna=True).head(5).to_dict() if hasattr(series, "value_counts") else {},
+            })
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        return candidates[:5]
+
     def _display_first_rows(self, adata: AnnData) -> Dict[str, Any]:
         """
         Return a lightweight preview of obs/var (first 5 rows) for LLM context.
@@ -719,6 +934,13 @@ class InspectionAgent(BaseAgent):
                     f"LLM did not choose a batch column; defaulting to top-ranked candidate '{batch_key_effective}'."
                 )
 
+            if batch_key_effective is None and batch_candidates:
+                batch_key_effective = batch_candidates[0]
+                info["batch_key_effective"] = batch_key_effective
+                warnings.append(
+                    f"LLM did not choose a batch column; defaulting to top-ranked candidate '{batch_key_effective}'."
+                )
+
             if info.get("batch_key_effective") is None:
                 info["batch_key_effective"] = batch_candidates[0] if batch_candidates else "batch"
                 warnings.append(
@@ -740,16 +962,6 @@ class InspectionAgent(BaseAgent):
 class PlannerAgent(BaseAgent):
     def __init__(self):
         super().__init__("Planner")
-
-    @staticmethod
-    def _counts_layer_valid(profile: Dict[str, Any], layer_name: Optional[str]) -> bool:
-        if not layer_name:
-            return False
-        if layer_name == "X":
-            stats = profile.get("matrix", {}) if isinstance(profile, dict) else {}
-        else:
-            stats = (profile.get("candidate_expression_layers") or {}).get(layer_name, {}) if isinstance(profile, dict) else {}
-        return isinstance(stats, dict) and stats.get("view_guess") == "counts"
 
     @staticmethod
     def _build_default_protocol(view: str) -> dict:
@@ -915,25 +1127,15 @@ class PlannerAgent(BaseAgent):
             except Exception:
                 subplan["sanitized_filename"] = None
 
-            # Adjust method compatibility based on primary layer suitability
-            profile = ins.get("profile") if isinstance(ins, dict) else {}
-            primary_source = profile.get("primary_source") if isinstance(profile, dict) else {}
-            primary_layer = None
-            if isinstance(primary_source, dict):
-                primary_layer = primary_source.get("use_layer")
-            if "scvi" in subplan.get("methods", {}):
-                if primary_layer == "counts" and self._counts_layer_valid(profile, primary_layer):
-                    cfg = subplan["methods"].get("scvi") or {}
-                    cfg["layer"] = primary_layer
-                    subplan["methods"]["scvi"] = cfg
-                else:
-                    reason = "scVI skipped because primary layer is not counts-like"
-                    if primary_layer:
-                        reason += f" (primary_layer={primary_layer})"
-                    subplan.setdefault("warnings", []).append(reason)
-                    subplan["methods"].pop("scvi", None)
-                    if not subplan.get("methods"):
-                        subplan["methods"] = {"harmony": {}}
+            # Adjust method compatibility based on view
+            view_guess = (ins.get("input_view") or "unknown").lower()
+            if view_guess != "counts" and "scvi" in subplan.get("methods", {}):
+                subplan.setdefault("warnings", []).append(
+                    "scVI skipped because input does not look like raw counts"
+                )
+                subplan["methods"].pop("scvi", None)
+                if not subplan.get("methods"):
+                    subplan["methods"] = {"harmony": {}}
 
             protocol = preprocess_protocols.get(modality) or self._build_default_protocol(view_guess)
             preprocess_protocols[modality] = protocol
