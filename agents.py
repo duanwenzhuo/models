@@ -23,6 +23,7 @@ from tools import (
     calculate_graph_connectivity,
     METRIC_SPECS,
     compute_metric_raw,
+    DetailedProfiler,
 )
 from openai import OpenAI
 
@@ -185,6 +186,227 @@ class InspectionAgent(BaseAgent):
 
     def __init__(self):
         super().__init__("Inspection")
+        self.require_llm = bool(getattr(config, "REQUIRE_LLM", False))
+
+    def _handle_llm_failure(self, context: str, error: Exception) -> None:
+        logger.error(f"[Inspection] LLM failure during {context}: {error}")
+        if self.require_llm:
+            raise RuntimeError(f"LLM unavailable during {context}: {error}") from error
+
+    @staticmethod
+    def _sample_dense_values(matrix: Any, max_samples: int = 50000) -> np.ndarray:
+        if matrix is None:
+            return np.array([])
+        try:
+            if sp.issparse(matrix):
+                data = matrix.data
+            else:
+                data = np.asarray(matrix)
+                if data.ndim > 1:
+                    data = data.ravel()
+            if data.size == 0:
+                return np.array([])
+            if data.size > max_samples:
+                idx = np.random.choice(data.size, size=max_samples, replace=False)
+                return data[idx]
+            return data
+        except Exception:
+            return np.array([])
+
+    def _matrix_fingerprint(self, data: Any) -> Dict[str, Any]:
+        values = self._sample_dense_values(data)
+        if values.size == 0:
+            return {
+                "value_min": None,
+                "value_max": None,
+                "q01": None,
+                "q50": None,
+                "q99": None,
+                "neg_rate": None,
+                "integer_fraction": None,
+                "sparsity": None,
+                "looks_like_counts": False,
+                "looks_like_log1p": False,
+                "looks_scaled": False,
+            }
+
+        quantiles = np.quantile(values, [0.01, 0.5, 0.99])
+        neg_rate = float(np.mean(values < 0))
+        integer_fraction = float(np.mean(np.isclose(values, np.round(values))))
+        sparsity = None
+        if sp.issparse(data):
+            total = data.shape[0] * data.shape[1]
+            sparsity = float(data.nnz / total) if total > 0 else None
+
+        looks_like_counts = bool(
+            (quantiles[2] is not None)
+            and (quantiles[2] > 20)
+            and integer_fraction > 0.8
+            and neg_rate < 0.01
+        )
+        looks_like_log1p = bool(
+            (quantiles[2] is not None)
+            and (quantiles[2] < 30)
+            and integer_fraction < 0.8
+            and neg_rate < 0.05
+        )
+        looks_scaled = bool(neg_rate > 0.05 or (abs(float(np.mean(values))) < 1 and np.std(values) < 5))
+
+        return {
+            "value_min": float(np.min(values)),
+            "value_max": float(np.max(values)),
+            "q01": float(quantiles[0]),
+            "q50": float(quantiles[1]),
+            "q99": float(quantiles[2]),
+            "neg_rate": neg_rate,
+            "integer_fraction": integer_fraction,
+            "sparsity": sparsity,
+            "looks_like_counts": looks_like_counts,
+            "looks_like_log1p": looks_like_log1p,
+            "looks_scaled": looks_scaled,
+        }
+
+    def _profile_layers(self, adata: AnnData) -> Dict[str, Any]:
+        layers_profile: Dict[str, Any] = {}
+        if hasattr(adata, "layers") and adata.layers:
+            for layer_name, arr in adata.layers.items():
+                layers_profile[layer_name] = self._matrix_fingerprint(arr)
+        return layers_profile
+
+    def _profile_obs(self, adata: AnnData) -> Dict[str, Any]:
+        obs_profile: Dict[str, Any] = {}
+        n_cells = adata.n_obs
+        for col in adata.obs.columns:
+            series = adata.obs[col]
+            missing_rate = float(series.isna().mean()) if hasattr(series, "isna") else 0.0
+            n_unique = int(series.nunique(dropna=True)) if hasattr(series, "nunique") else 0
+            top_levels = (
+                series.value_counts(dropna=True).head(5).to_dict()
+                if hasattr(series, "value_counts")
+                else {}
+            )
+            looks_like_id = n_unique >= max(2, int(0.9 * n_cells))
+            obs_profile[col] = {
+                "dtype": str(series.dtype),
+                "missing_rate": missing_rate,
+                "n_unique": n_unique,
+                "top_levels": top_levels,
+                "looks_like_id": looks_like_id,
+            }
+        return obs_profile
+
+    def _profile_var(self, adata: AnnData) -> Dict[str, Any]:
+        var_profile: Dict[str, Any] = {}
+        var_names = adata.var_names.astype(str)
+        atac_like = bool(np.mean([":" in v or "-" in v for v in var_names[: min(len(var_names), 2000)]]) > 0.3)
+        mt_ratio = float(np.mean([v.startswith("MT-") for v in var_names[: min(len(var_names), 5000)]]))
+        var_profile["var_name_prefix"] = {
+            "atac_peak_like": atac_like,
+            "mt_prefix_ratio": mt_ratio,
+        }
+        return var_profile
+
+    def _build_profile(self, adata: AnnData) -> Dict[str, Any]:
+        X = adata.X
+        primary_fp = self._matrix_fingerprint(X)
+        layers_fp = self._profile_layers(adata)
+        primary_layer = None
+        for candidate in ["counts", "raw", "activity"]:
+            if candidate in layers_fp:
+                primary_layer = candidate
+                primary_fp = layers_fp[candidate]
+                break
+        profile = {
+            "matrix": primary_fp,
+            "layers": layers_fp,
+            "primary_layer": primary_layer or "X",
+            "library_size": {},
+            "detected_genes_per_cell": {},
+            "obs": self._profile_obs(adata),
+            "var": self._profile_var(adata),
+        }
+
+        try:
+            libsize = np.array(adata.X.sum(axis=1)).ravel()
+            profile["library_size"] = {
+                "mean": float(np.mean(libsize)),
+                "median": float(np.median(libsize)),
+                "q99": float(np.quantile(libsize, 0.99)),
+            }
+            detected = np.array((adata.X > 0).sum(axis=1)).ravel()
+            profile["detected_genes_per_cell"] = {
+                "mean": float(np.mean(detected)),
+                "median": float(np.median(detected)),
+                "q99": float(np.quantile(detected, 0.99)),
+            }
+        except Exception:
+            pass
+
+        return profile
+
+    def _generate_policy_from_llm(self, profile: Dict[str, Any], modality: str, user_intent: str) -> Dict[str, Any]:
+        system_prompt = (
+            "You are a cautious bioinformatics assistant. Given a structured AnnData profile, "
+            "propose a preprocessing recipe. Only return JSON with fields primary_layer, preprocess_needed, "
+            "steps, skip_if_present, warnings, confidence. Steps should be a list of objects with 'name' and 'params'."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"Modality: {modality}\nProfile: {json.dumps(profile)[:6000]}\n"
+                    f"User intent: {user_intent}\nReturn JSON only."
+                ),
+            },
+        ]
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                temperature=0.0,
+            )
+            content = resp.choices[0].message.content.strip()
+            cleaned = content.replace("```json", "").replace("```", "").strip()
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception as e:
+            self._handle_llm_failure("policy generation", e)
+        return {}
+
+    def _rank_batch_candidates(self, adata: AnnData) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        n_cells = adata.n_obs
+        keywords = ["batch", "donor", "sample", "library", "tech", "technology", "lane", "dataset", "origin", "replicate"]
+        exclude_tokens = ["cell", "barcode", "id", "index"]
+        for col in adata.obs.columns:
+            if not isinstance(col, str):
+                continue
+            col_lower = col.lower()
+            if any(tok in col_lower for tok in exclude_tokens):
+                continue
+            series = adata.obs[col]
+            missing_rate = float(series.isna().mean()) if hasattr(series, "isna") else 0.0
+            n_unique = int(series.nunique(dropna=True)) if hasattr(series, "nunique") else 0
+            if n_unique < 2 or n_unique > min(200, int(0.2 * max(1, n_cells))):
+                continue
+            if missing_rate >= 0.2:
+                continue
+            score = 1.0
+            if series.dtype == "category" or str(series.dtype).startswith("object"):
+                score += 0.5
+            if any(k in col_lower for k in keywords):
+                score += 1.0
+            candidates.append({
+                "name": col,
+                "score": score,
+                "n_unique": n_unique,
+                "missing_rate": missing_rate,
+                "top_levels": series.value_counts(dropna=True).head(5).to_dict() if hasattr(series, "value_counts") else {},
+            })
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        return candidates[:5]
 
     def _display_first_rows(self, adata: AnnData) -> Dict[str, Any]:
         """
@@ -279,7 +501,7 @@ class InspectionAgent(BaseAgent):
             logger.info(f"[Inspection] LLM returned modality guess: {modality_val}")
             return modality_val or "unknown"
         except Exception as e:
-            logger.error(f"[Inspection] LLM failed to infer modality: {e}")
+            self._handle_llm_failure("modality inference", e)
             return "unknown"
     def _infer_batch_key_from_llm(self, adata: AnnData, user_intent: str) -> Optional[str]:
         """
@@ -313,7 +535,7 @@ class InspectionAgent(BaseAgent):
                 return batch_val
             return None
         except Exception as e:
-            logger.error(f"[Inspection] LLM failed to infer batch key: {e}")
+            self._handle_llm_failure("batch inference", e)
             return None
 
     def inspect_adata(self, adata: AnnData, user_intent: str = "Please identify the modality and batch column") -> dict:
@@ -329,10 +551,10 @@ class InspectionAgent(BaseAgent):
         info["obs_columns"] = obs_cols
         info["var_columns"] = adata.var.columns.tolist()
 
-        batch_candidates = [
-            c for c in obs_cols if isinstance(c, str) and "batch" in c.lower()
-        ]
-        info["batch_candidates"] = batch_candidates
+        profile = DetailedProfiler.profile_adata(adata)
+        ranked_batches = profile.get("batch_candidates_ranked") or self._rank_batch_candidates(adata)
+        batch_candidates = [c["name"] for c in ranked_batches]
+        info["batch_candidates"] = ranked_batches
         info["has_batch"] = len(batch_candidates) > 0
 
         # LLM 推断模态和批次键
@@ -343,37 +565,17 @@ class InspectionAgent(BaseAgent):
 
         # 继续收集其他元信息
         X = adata.X
-        if X is None:
-            info["matrix_valid"] = False
-            info["nonzero_elements"] = 0
-            is_integer_like = False
-            sample_vals = np.array([])
-        else:
-            info["matrix_valid"] = True
-            if sp.issparse(X):
-                info["nonzero_elements"] = int(X.nnz)
-                sample_vals = X.data
-            else:
-                info["nonzero_elements"] = int(np.count_nonzero(X))
-                sample_vals = X.ravel()
+        info["matrix_valid"] = X is not None
+        info["nonzero_elements"] = int(X.nnz) if (X is not None and sp.issparse(X)) else int(np.count_nonzero(X)) if X is not None else 0
 
-            if sample_vals.size > 0:
-                subset = sample_vals[: min(sample_vals.size, 5000)]
-                is_integer_like = bool(np.allclose(subset, np.round(subset)))
-            else:
-                is_integer_like = False
-
+        info["profile"] = profile
         info["has_pca"] = "X_pca" in adata.obsm
         info["has_umap"] = "X_umap" in adata.obsm
         info["has_neighbors"] = ("neighbors" in adata.uns) or ("neighbors" in adata.obsp)
         info["has_raw"] = adata.raw is not None
-        info["is_integer_like"] = is_integer_like
-
-        has_log1p = False
-        if X is not None and info["matrix_valid"]:
-            if not is_integer_like:
-                has_log1p = True
-        info["has_log1p"] = has_log1p
+        info["is_integer_like"] = bool(profile.get("matrix", {}).get("integer_fraction", 0) > 0.9)
+        info["input_view"] = profile.get("view_guess", "unknown")
+        info["primary_source"] = profile.get("primary_source")
 
         ready_for_integration = info["has_pca"] and info["has_neighbors"]
         info["preprocessing"] = {
@@ -381,14 +583,16 @@ class InspectionAgent(BaseAgent):
             "has_pca": info["has_pca"],
             "has_umap": info["has_umap"],
             "has_neighbors": info["has_neighbors"],
-            "has_log1p": info["has_log1p"],
-            "is_integer_like": info["is_integer_like"],
+            "looks_like_counts": profile.get("view_guess") == "counts",
+            "looks_like_log1p": profile.get("view_guess") == "log1p",
+            "looks_scaled": profile.get("view_guess") == "scaled",
             "ready_for_integration": ready_for_integration,
         }
 
         info["modality"] = modality_guess or "unknown"
         info["modality_guess"] = modality_guess or "unknown"
         info["batch_key_effective"] = batch_key_effective
+        info["policy"] = {}
 
         return info
 
@@ -415,16 +619,34 @@ class InspectionAgent(BaseAgent):
             modality_name = info.get("modality") or "unknown"
 
             obs_columns = info.get("obs_columns", [])
-            batch_candidates = info.get("batch_candidates") or []
+            candidate_entries = info.get("batch_candidates") or []
+            batch_candidates = [
+                c.get("name") if isinstance(c, dict) else str(c)
+                for c in candidate_entries
+                if c is not None
+            ]
             user_intent = state.get("user_intent", "")
 
+            warnings = []
+
             if not batch_candidates:
-                msg = (
-                    f"Inspection found no batch-like columns for modality '{modality_name}'. "
-                    f"obs_columns={obs_columns}"
+                adata.obs["batch"] = "batch0"
+                batch_candidates = ["batch"]
+                candidate_entries = [
+                    {
+                        "name": "batch",
+                        "score": 0.0,
+                        "n_unique": 1,
+                        "missing_rate": 0.0,
+                        "top_levels": {"batch0": adata.n_obs},
+                    }
+                ]
+                info["batch_candidates"] = candidate_entries
+                warnings.append(
+                    "No batch-like column detected; created a single-batch placeholder 'batch'. Batch effect metrics may be uninformative."
                 )
-                logger.error(f"[Inspection] {msg}")
-                raise ValueError(msg)
+
+            info["warnings"] = warnings
 
             batch_key_effective = info.get("batch_key_effective")
             if batch_key_effective is None and len(batch_candidates) == 1:
@@ -485,18 +707,23 @@ class InspectionAgent(BaseAgent):
                         logger.error(
                             f"[Inspection] LLM did not return a valid batch_key from candidates. "
                             f"parsed={parsed}"
-                        )
+                    )
 
                 except Exception as e:
-                    logger.error(f"[Inspection] LLM-based batch_key selection failed: {e}")
+                    self._handle_llm_failure("batch candidate selection", e)
+
+            if batch_key_effective is None and batch_candidates:
+                batch_key_effective = batch_candidates[0]
+                info["batch_key_effective"] = batch_key_effective
+                warnings.append(
+                    f"LLM did not choose a batch column; defaulting to top-ranked candidate '{batch_key_effective}'."
+                )
 
             if info.get("batch_key_effective") is None:
-                msg = (
-                    f"Inspection did not determine batch_key_effective for modality '{modality_name}'. "
-                    f"obs_columns={obs_columns}, candidates={batch_candidates}"
+                info["batch_key_effective"] = batch_candidates[0] if batch_candidates else "batch"
+                warnings.append(
+                    "Batch key was not resolved by LLM; using fallback 'batch'. Integration metrics may be limited."
                 )
-                logger.error(f"[Inspection] {msg}")
-                raise ValueError(msg)
 
             state["inspection"] = {modality_name: info}
             logger.info(f"[Inspection] Done. Summary: {info}")
@@ -513,6 +740,50 @@ class InspectionAgent(BaseAgent):
 class PlannerAgent(BaseAgent):
     def __init__(self):
         super().__init__("Planner")
+
+    @staticmethod
+    def _build_default_protocol(view: str) -> dict:
+        view_lower = (view or "unknown").lower()
+        if view_lower == "counts":
+            steps = [
+                {"name": "qc_metrics", "params": {"mito_prefix": "MT-"}},
+                {"name": "filter_cells", "params": {"min_genes": 200}},
+                {"name": "filter_genes", "params": {"min_cells": 3}},
+                {"name": "normalize_total", "params": {"target_sum": 10000}},
+                {"name": "log1p", "params": {}},
+                {"name": "hvg", "params": {"flavor": "seurat_v3", "n_top_genes": 2000}},
+                {"name": "scale", "params": {"max_value": 10}},
+                {"name": "pca", "params": {"n_comps": 50}},
+                {"name": "neighbors", "params": {"n_neighbors": 15, "n_pcs": 40}},
+            ]
+        elif view_lower == "log1p":
+            steps = [
+                {"name": "qc_metrics", "params": {"mito_prefix": "MT-"}},
+                {"name": "filter_cells", "params": {"min_genes": 200}},
+                {"name": "filter_genes", "params": {"min_cells": 3}},
+                {"name": "hvg", "params": {"flavor": "seurat_v3", "n_top_genes": 2000}},
+                {"name": "scale", "params": {"max_value": 10}},
+                {"name": "pca", "params": {"n_comps": 50}},
+                {"name": "neighbors", "params": {"n_neighbors": 15, "n_pcs": 40}},
+            ]
+        else:
+            steps = [
+                {"name": "qc_metrics", "params": {"mito_prefix": "MT-"}},
+                {"name": "filter_cells", "params": {"min_genes": 100}},
+                {"name": "filter_genes", "params": {"min_cells": 3}},
+                {"name": "hvg", "params": {"n_top_genes": 2000}},
+                {"name": "pca", "params": {"n_comps": 50}},
+                {"name": "neighbors", "params": {"n_neighbors": 15, "n_pcs": 40}},
+            ]
+
+        return {
+            "primary_layer": None,
+            "preprocess_needed": True,
+            "steps": steps,
+            "skip_if_present": ["pca", "neighbors"],
+            "warnings": [],
+            "confidence": 0.5,
+        }
 
     def _validate_and_normalize_plan(self, raw_plan: dict, inspection: Dict[str, Any]) -> dict:
         valid_plan = {}
@@ -593,6 +864,7 @@ class PlannerAgent(BaseAgent):
         modalities_for_plan = list(inspection.keys()) or detected_modalities or ["RNA"]
 
         raw_plan = {}
+        preprocess_protocols: Dict[str, Any] = {}
         for modality in modalities_for_plan:
             reco = parser.infer_preprocessing(modality)
             preprocess_recos[modality] = reco
@@ -605,6 +877,10 @@ class PlannerAgent(BaseAgent):
                 "methods": methods,
                 "modality": modality,
             }
+
+            insp_profile = (inspection.get(modality) or next(iter(inspection.values()), {})).get("profile", {})
+            view_guess = insp_profile.get("view_guess", "unknown")
+            preprocess_protocols[modality] = self._build_default_protocol(view_guess)
 
         state["preprocess_recommendations"] = preprocess_recos
         plan = self._validate_and_normalize_plan(raw_plan, inspection)
@@ -627,7 +903,21 @@ class PlannerAgent(BaseAgent):
             except Exception:
                 subplan["sanitized_filename"] = None
 
+            # Adjust method compatibility based on view
+            view_guess = (ins.get("input_view") or "unknown").lower()
+            if view_guess != "counts" and "scvi" in subplan.get("methods", {}):
+                subplan.setdefault("warnings", []).append(
+                    "scVI skipped because input does not look like raw counts"
+                )
+                subplan["methods"].pop("scvi", None)
+                if not subplan.get("methods"):
+                    subplan["methods"] = {"harmony": {}}
+
+            protocol = preprocess_protocols.get(modality) or self._build_default_protocol(view_guess)
+            preprocess_protocols[modality] = protocol
+
         state["plan"] = plan
+        state["preprocess_protocols"] = preprocess_protocols
         logger.info(f"📋 [Planner] Plan created: {plan}")
         return state
 
@@ -872,6 +1162,7 @@ class PreprocessAgent(BaseAgent):
         data_path = state.get("data_path")
         benchmark_fraction = state.get("benchmark_fraction")
         subset_cfg = state.get("subset_config") or {}
+        preprocess_protocols = state.get("preprocess_protocols") or {}
 
         # Ensure containers exist and are dicts
         if not isinstance(state.get("data_hvg"), dict):
@@ -909,10 +1200,20 @@ class PreprocessAgent(BaseAgent):
                     f"[Preprocessor] Intent suggested preprocessing helper: {reco.get('preferred_method')} (need_preprocess={preprocess_flag})"
                 )
             try:
+                inspection_info = (state.get("inspection") or {}).get(modality, {})
+                profile = inspection_info.get("profile") if isinstance(inspection_info, dict) else None
+                protocol = preprocess_protocols.get(modality)
+                primary_source = None
+                if isinstance(profile, dict):
+                    primary_source = profile.get("primary_source")
+
                 adata_hvg, adata_raw = OmicsTools.load_and_preprocess(
                     data_path,
                     original_batch_key=batch_key,
-                    modality=modality_param
+                    modality=modality_param,
+                    protocol=protocol,
+                    profile=profile,
+                    primary_source=primary_source,
                 )
                 adata_hvg, adata_raw = self._apply_subsets(adata_hvg, adata_raw, subset_cfg.get(modality, subset_cfg), modality)
                 state["data_hvg_full"][modality] = adata_hvg.copy()

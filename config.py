@@ -12,6 +12,10 @@ OPENAI_API_KEY = ""
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 LLM_MODEL = "gpt-4o"
 
+# Fail-fast switch: when True, any LLM unavailability should halt the workflow
+# during development/testing rather than silently falling back.
+REQUIRE_LLM = os.getenv("REQUIRE_LLM", "true").lower() in {"1", "true", "yes"}
+
 RSCRIPT_PATH = r"C:\Program Files\R\R-4.4.1\bin\x64\Rscript.exe"
 
 # Paths
