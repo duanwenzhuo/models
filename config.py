@@ -19,7 +19,7 @@ RSCRIPT_PATH = r"C:\Program Files\R\R-4.4.1\bin\x64\Rscript.exe"
 
 # Paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 LOGS_DIR = os.path.join(RESULTS_DIR, "logs")
 

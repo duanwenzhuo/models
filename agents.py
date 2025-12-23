@@ -49,7 +49,10 @@ def build_openai_client() -> OpenAI:
     return OpenAI(**client_kwargs)
 
 
-client = build_openai_client()
+client = client = OpenAI(
+    api_key="sk-L1TUuj5pxxyBbg1aNiM2t5fQGdbhAOmJtgVufoXiek3KZLnJ",
+    base_url="https://api.lmtgpt.top/v1"
+    )
 
 # Integration method normalization helpers
 ALLOWED_INTEGRATION_METHODS = {"scvi", "harmony", "mnn", "cca", "liger"}

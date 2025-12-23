@@ -749,8 +749,6 @@ class DataPreprocessor:
         return adata_hvg, raw_adata_storage
 
 class ScVIIntegration:
-    """scVI ????"""
-    # ?????????????????
     def __init__(self, adata_hvg: sc.AnnData, adata_raw_full: sc.AnnData, batch_key: str,
                  is_count_data: bool = True, model_save_path: Optional[str] = None,
                  n_latent: int = 20, max_epochs: int = 50, batch_size: Optional[int] = None,
