@@ -53,6 +53,267 @@ CELL_CYCLE_GENES: Dict[str, list[str]] = {
 }
 
 
+class DetailedProfiler:
+    """Lightweight, deterministic profiler for AnnData objects."""
+
+    @staticmethod
+    def _sample_values(matrix: Any, max_samples: int = 50000) -> np.ndarray:
+        if matrix is None:
+            return np.array([])
+        try:
+            if sp.issparse(matrix):
+                data = matrix.data
+            else:
+                data = np.asarray(matrix)
+                if data.ndim > 1:
+                    data = data.ravel()
+            if data.size == 0:
+                return np.array([])
+            if data.size > max_samples:
+                idx = np.random.choice(data.size, size=max_samples, replace=False)
+                data = data[idx]
+            return np.asarray(data)
+        except Exception:
+            return np.array([])
+
+    @classmethod
+    def _matrix_stats(cls, matrix: Any, shape: tuple[int, int]) -> Dict[str, Any]:
+        values = cls._sample_values(matrix)
+        if values.size == 0:
+            return {
+                "value_min": None,
+                "value_max": None,
+                "q01": None,
+                "q50": None,
+                "q99": None,
+                "neg_rate": None,
+                "integer_fraction": None,
+                "sparsity": None,
+                "view_guess": "unknown",
+            }
+
+        quantiles = np.quantile(values, [0.01, 0.5, 0.99])
+        neg_rate = float(np.mean(values < 0))
+        integer_fraction = float(np.mean(np.isclose(values, np.round(values))))
+        sparsity = None
+        if sp.issparse(matrix):
+            total = shape[0] * shape[1]
+            sparsity = float(matrix.nnz / total) if total > 0 else None
+
+        view_guess = "unknown"
+        if (quantiles[2] > 20) and integer_fraction > 0.85 and neg_rate < 0.01:
+            view_guess = "counts"
+        elif quantiles[2] < 30 and integer_fraction < 0.85 and neg_rate < 0.05:
+            view_guess = "log1p"
+        elif neg_rate > 0.05 or (abs(float(np.mean(values))) < 1 and np.std(values) < 5):
+            view_guess = "scaled"
+
+        return {
+            "value_min": float(np.min(values)),
+            "value_max": float(np.max(values)),
+            "q01": float(quantiles[0]),
+            "q50": float(quantiles[1]),
+            "q99": float(quantiles[2]),
+            "neg_rate": neg_rate,
+            "integer_fraction": integer_fraction,
+            "sparsity": sparsity,
+            "view_guess": view_guess,
+        }
+
+    @staticmethod
+    def _libsize_stats(matrix: Any) -> Dict[str, Any]:
+        try:
+            libsize = np.array(matrix.sum(axis=1)).ravel()
+            return {
+                "mean": float(np.mean(libsize)),
+                "median": float(np.median(libsize)),
+                "q95": float(np.quantile(libsize, 0.95)),
+                "q99": float(np.quantile(libsize, 0.99)),
+            }
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _detected_stats(matrix: Any) -> Dict[str, Any]:
+        try:
+            detected = np.array((matrix > 0).sum(axis=1)).ravel()
+            return {
+                "median": float(np.median(detected)),
+                "q95": float(np.quantile(detected, 0.95)),
+            }
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _obs_profile(adata: anndata.AnnData) -> Dict[str, Any]:
+        profile: Dict[str, Any] = {}
+        n_cells = adata.n_obs
+        for col in adata.obs.columns:
+            series = adata.obs[col]
+            missing_rate = float(series.isna().mean()) if hasattr(series, "isna") else 0.0
+            n_unique = int(series.nunique(dropna=True)) if hasattr(series, "nunique") else 0
+            top_levels = (
+                series.value_counts(dropna=True).head(5).to_dict()
+                if hasattr(series, "value_counts")
+                else {}
+            )
+            looks_like_id = n_unique >= max(2, int(0.9 * n_cells))
+            profile[col] = {
+                "dtype": str(series.dtype),
+                "missing_rate": missing_rate,
+                "n_unique": n_unique,
+                "top_levels": top_levels,
+                "looks_like_id": looks_like_id,
+            }
+        return profile
+
+    @staticmethod
+    def _rank_batch_candidates(adata: anndata.AnnData) -> list[Dict[str, Any]]:
+        candidates: list[Dict[str, Any]] = []
+        n_cells = adata.n_obs
+        keywords = ["batch", "donor", "sample", "library", "tech", "technology", "lane", "dataset", "origin", "replicate"]
+        exclude_tokens = ["cell", "barcode", "id", "index"]
+        for col in adata.obs.columns:
+            if not isinstance(col, str):
+                continue
+            col_lower = col.lower()
+            if any(tok in col_lower for tok in exclude_tokens):
+                continue
+            series = adata.obs[col]
+            missing_rate = float(series.isna().mean()) if hasattr(series, "isna") else 0.0
+            n_unique = int(series.nunique(dropna=True)) if hasattr(series, "nunique") else 0
+            if n_unique < 2 or n_unique > min(200, int(0.2 * max(1, n_cells))):
+                continue
+            if missing_rate >= 0.2:
+                continue
+            top_levels = series.value_counts(dropna=True).head(5).to_dict() if hasattr(series, "value_counts") else {}
+            score = 1.0
+            if series.dtype == "category" or str(series.dtype).startswith("object"):
+                score += 0.5
+            if any(k in col_lower for k in keywords):
+                score += 1.0
+            candidates.append(
+                {
+                    "name": col,
+                    "score": score,
+                    "n_unique": n_unique,
+                    "missing_rate": missing_rate,
+                    "top_levels": top_levels,
+                }
+            )
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        return candidates[:5]
+
+    @staticmethod
+    def _var_profile(adata: anndata.AnnData) -> Dict[str, Any]:
+        var_names = adata.var_names.astype(str)
+        sample_size = min(len(var_names), 5000)
+        atac_like = False
+        if sample_size:
+            atac_like = bool(np.mean([":" in v or "-" in v for v in var_names[:sample_size]]) > 0.3)
+        mt_ratio = float(np.mean([v.startswith("MT-") for v in var_names[:sample_size]])) if sample_size else 0.0
+        ribo_ratio = float(
+            np.mean([v.startswith("RPL") or v.startswith("RPS") for v in var_names[:sample_size]])
+        ) if sample_size else 0.0
+        return {
+            "var_name_prefix": {
+                "atac_peak_like": atac_like,
+                "mt_prefix_ratio": mt_ratio,
+                "ribo_prefix_ratio": ribo_ratio,
+            }
+        }
+
+    @classmethod
+    def profile_adata(cls, adata: anndata.AnnData) -> Dict[str, Any]:
+        profile: Dict[str, Any] = {}
+        X = adata.X
+        profile["matrix"] = cls._matrix_stats(X, (adata.n_obs, adata.n_vars))
+
+        layers_profile: Dict[str, Any] = {}
+        candidate_expression_layers: Dict[str, Any] = {}
+        if hasattr(adata, "layers") and adata.layers:
+            for layer_name, arr in adata.layers.items():
+                stats = cls._matrix_stats(arr, (adata.n_obs, adata.n_vars))
+                layers_profile[layer_name] = stats
+                candidate_expression_layers[layer_name] = stats
+
+        profile["layers"] = layers_profile
+
+        # Choose primary source
+        primary_layer = None
+        for candidate in ["counts", "raw", "activity", "expr"]:
+            if candidate in candidate_expression_layers:
+                primary_layer = candidate
+                break
+        if primary_layer is None:
+            primary_layer = "X"
+        profile["primary_source"] = {"use_layer": primary_layer, "confidence": 0.8}
+
+        profile["library_size"] = cls._libsize_stats(X)
+        profile["detected_features_per_cell"] = cls._detected_stats(X)
+        profile["obs"] = cls._obs_profile(adata)
+        profile["var"] = cls._var_profile(adata)
+        profile["batch_candidates_ranked"] = cls._rank_batch_candidates(adata)
+        profile["candidate_expression_layers"] = candidate_expression_layers
+        profile["view_guess"] = profile["matrix"].get("view_guess", "unknown")
+        return profile
+
+
+class ProtocolValidator:
+    """Validate and sanitize protocol dictionaries from LLM or defaults."""
+
+    ALLOWED_STEPS: tuple[str, ...] = (
+        "qc_metrics",
+        "filter_cells",
+        "filter_genes",
+        "normalize_total",
+        "log1p",
+        "hvg",
+        "scale",
+        "pca",
+        "neighbors",
+        "umap",
+    )
+
+    @classmethod
+    def validate(cls, protocol: Optional[dict]) -> dict:
+        if not isinstance(protocol, dict):
+            return {}
+
+        cleaned: Dict[str, Any] = {
+            "primary_layer": protocol.get("primary_layer"),
+            "preprocess_needed": bool(protocol.get("preprocess_needed", True)),
+            "skip_if_present": [],
+            "warnings": protocol.get("warnings") or [],
+            "confidence": protocol.get("confidence", 0.0),
+        }
+
+        skip_if_present = protocol.get("skip_if_present") or []
+        if isinstance(skip_if_present, list):
+            cleaned["skip_if_present"] = [s for s in skip_if_present if s in {"pca", "neighbors", "umap"}]
+
+        steps = []
+        for step in protocol.get("steps", []):
+            name = (step or {}).get("name") if isinstance(step, dict) else None
+            params = (step or {}).get("params", {}) if isinstance(step, dict) else {}
+            if name in cls.ALLOWED_STEPS:
+                steps.append({"name": name, "params": params or {}})
+        cleaned["steps"] = steps
+        return cleaned
+
+
+class ProtocolExecutor:
+    """Execute validated protocol steps on AnnData with skip/guard rails."""
+
+    def __init__(self, protocol: dict, primary_source: Optional[dict] = None):
+        self.protocol = protocol or {}
+        self.primary_source = primary_source or {}
+
+    def run(self, adata: sc.AnnData) -> tuple[sc.AnnData, sc.AnnData]:
+        preprocessor = DataPreprocessor(adata=adata, protocol=self.protocol, primary_source=self.primary_source)
+        return preprocessor._apply_recipe()
+
+
 def slugify_dataset_name(path_or_name: str) -> str:
     """
     Normalize a dataset name into a safe slug.
@@ -364,21 +625,109 @@ def write_r_liger_seurat_script(
 # 注：DatasetFeatureChecker 类被移除，因为它不被 agents.py 调用。
 
 class DataPreprocessor:
-    """数据预处理类，处理过滤、标准化、PCA 和 UMAP"""
-    # 构造函数现在直接接受所需的配置参数，而不是 DataConfig 对象
-    def __init__(self, adata: sc.AnnData, is_count_data: bool = True):
+    """数据预处理类，支持固定流程或基于 recipe 的可控流水线。"""
+
+    ALLOWED_STEP_PARAMS: Dict[str, set[str]] = {
+        "qc_metrics": {"qc_vars", "mito_prefix", "mt_col"},
+        "filter_cells": {"min_genes", "min_counts", "max_counts", "max_genes", "percent_mito", "percent_ribo"},
+        "filter_genes": {"min_cells", "min_counts", "max_counts"},
+        "normalize_total": {"target_sum", "exclude_highly_expressed", "max_fraction", "inplace"},
+        "log1p": {"base"},
+        "hvg": {"flavor", "n_top_genes", "min_mean", "max_mean", "min_disp"},
+        "scale": {"zero_center", "max_value"},
+        "pca": {"n_comps", "svd_solver", "use_highly_variable", "random_state"},
+        "neighbors": {"n_neighbors", "n_pcs", "use_rep", "method", "metric"},
+        "umap": {"n_components", "min_dist", "spread"},
+    }
+
+    @staticmethod
+    def _qc_metrics_step(ad: sc.AnnData, params: dict) -> None:
+        qc_vars = params.get("qc_vars")
+        if qc_vars is None:
+            mito_prefix = params.get("mito_prefix")
+            if mito_prefix:
+                mt_col = params.get("mt_col", "mt")
+                ad.var[mt_col] = ad.var_names.str.startswith(mito_prefix)
+                qc_vars = [mt_col]
+        sc.pp.calculate_qc_metrics(ad, qc_vars=qc_vars, percent_top=None, log1p=False, inplace=True)
+
+    STEP_MAP: Dict[str, Callable[[sc.AnnData, dict], None]] = {
+        "qc_metrics": _qc_metrics_step.__func__,
+        "filter_cells": lambda ad, p: sc.pp.filter_cells(ad, **p),
+        "filter_genes": lambda ad, p: sc.pp.filter_genes(ad, **p),
+        "normalize_total": lambda ad, p: sc.pp.normalize_total(ad, **p),
+        "log1p": lambda ad, p: sc.pp.log1p(ad, **p),
+        "hvg": lambda ad, p: sc.pp.highly_variable_genes(ad, **p),
+        "scale": lambda ad, p: sc.pp.scale(ad, **p),
+        "pca": lambda ad, p: sc.tl.pca(ad, **p),
+        "neighbors": lambda ad, p: sc.pp.neighbors(ad, **p),
+        "umap": lambda ad, p: sc.tl.umap(ad, **p),
+    }
+
+    def __init__(
+        self,
+        adata: sc.AnnData,
+        is_count_data: bool = True,
+        recipe: Optional[dict] = None,
+        profile: Optional[dict] = None,
+        protocol: Optional[dict] = None,
+        primary_source: Optional[dict] = None,
+    ):
         self.adata = adata
         self.is_count_data = is_count_data
+        self.recipe = recipe or {}
+        self.profile = profile or {}
+        self.protocol = ProtocolValidator.validate(protocol or self.recipe)
+        self.primary_source = primary_source or {}
 
-    def preprocess(self) -> tuple[sc.AnnData, sc.AnnData]: 
-        """执行过滤、HVG、PCA 和 UMAP。返回 (adata_hvg, adata_raw)。"""
+    def _apply_recipe(self) -> tuple[sc.AnnData, sc.AnnData]:
         adata = self.adata.copy()
-        
-        # --- 过滤 (使用默认值) ---
+        raw_adata_storage = adata.copy()
+
+        chosen_layer = None
+        primary_layer = self.primary_source.get("use_layer") or self.protocol.get("primary_layer")
+        if primary_layer and primary_layer in adata.layers:
+            adata.X = adata.layers[primary_layer].copy()
+            chosen_layer = primary_layer
+
+        hv_mask = None
+        skip_if_present = set(self.protocol.get("skip_if_present") or [])
+        presence_checks = {
+            "pca": lambda ad: "X_pca" in ad.obsm,
+            "neighbors": lambda ad: ("neighbors" in ad.uns) or ("neighbors" in ad.obsp),
+            "umap": lambda ad: "X_umap" in ad.obsm,
+        }
+        for step in self.protocol.get("steps", []):
+            name = step.get("name")
+            params = step.get("params", {}) if isinstance(step, dict) else {}
+            params = {k: v for k, v in (params or {}).items() if k in self.ALLOWED_STEP_PARAMS.get(name, set())}
+            func = self.STEP_MAP.get(name)
+            if func:
+                if name in skip_if_present:
+                    checker = presence_checks.get(name)
+                    if checker and checker(adata):
+                        continue
+                func(adata, params)
+                if name == "hvg" and "highly_variable" in adata.var:
+                    hv_mask = adata.var["highly_variable"].values
+            else:
+                logger.warning("[DataPreprocessor] Unknown step '%s' skipped", name)
+
+        adata_hvg = adata[:, hv_mask].copy() if hv_mask is not None else adata.copy()
+        if chosen_layer:
+            adata_hvg.uns["_protocol_primary_layer"] = chosen_layer
+        return adata_hvg, raw_adata_storage
+
+    def preprocess(self) -> tuple[sc.AnnData, sc.AnnData]:
+        """执行过滤、HVG、PCA 和 UMAP。返回 (adata_hvg, adata_raw)。"""
+        if self.protocol:
+            return self._apply_recipe()
+
+        adata = self.adata.copy()
+
         sc.pp.filter_cells(adata, min_genes=100 if self.is_count_data else 10)
         sc.pp.filter_genes(adata, min_cells=1)
-        
-        # QC Metrics
+
         if self.is_count_data:
             adata.var['mt'] = adata.var_names.str.startswith('MT-')
             sc.pp.calculate_qc_metrics(adata, qc_vars=['mt'], percent_top=None, log1p=False, inplace=True)
@@ -386,8 +735,9 @@ class DataPreprocessor:
             sc.pp.calculate_qc_metrics(adata, percent_top=None, log1p=False, inplace=True)
 
         raw_adata_storage = adata.copy() # Raw data for scVI
-        
-        # --- HVG & PCA & UMAP ---
+
+        sc.pp.normalize_total(adata)
+        sc.pp.log1p(adata)
         sc.pp.highly_variable_genes(adata, min_mean=0.0125, max_mean=3, min_disp=0.5)
         adata_hvg = adata[:, adata.var['highly_variable']].copy()
         sc.pp.scale(adata_hvg, max_value=10)
@@ -401,11 +751,11 @@ class DataPreprocessor:
 class ScVIIntegration:
     """scVI ????"""
     # ?????????????????
-    def __init__(self, adata_hvg: sc.AnnData, adata_raw_full: sc.AnnData, batch_key: str, 
-                 is_count_data: bool = True, model_save_path: Optional[str] = None, 
+    def __init__(self, adata_hvg: sc.AnnData, adata_raw_full: sc.AnnData, batch_key: str,
+                 is_count_data: bool = True, model_save_path: Optional[str] = None,
                  n_latent: int = 20, max_epochs: int = 50, batch_size: Optional[int] = None,
                  n_layers: Optional[int] = None, early_stopping: bool = False,
-                 early_stopping_patience: int = 20):
+                 early_stopping_patience: int = 20, layer: Optional[str] = None):
         self.adata_hvg = adata_hvg
         self.adata_raw_full = adata_raw_full
         self.batch_key = batch_key
@@ -417,15 +767,16 @@ class ScVIIntegration:
         self.n_layers = n_layers
         self.early_stopping = early_stopping
         self.early_stopping_patience = early_stopping_patience
+        self.layer = layer
 
     def integrate(self) -> sc.AnnData:
         """?? scVI ??"""
         # ?? raw data ? hvg ??? cell ? gene ????
         adata_raw = self.adata_raw_full[self.adata_hvg.obs_names, self.adata_hvg.var_names].copy()
         adata_raw.obs[self.batch_key] = self.adata_hvg.obs[self.batch_key].copy()
-        
-        layer_name = "counts" if self.is_count_data else "activity"
-        adata_raw.layers[layer_name] = adata_raw.X.copy() 
+
+        layer_name = self.layer or ("counts" if self.is_count_data else "activity")
+        adata_raw.layers[layer_name] = adata_raw.X.copy()
 
         scvi.model.SCVI.setup_anndata(adata_raw, layer=layer_name, batch_key=self.batch_key)
         
@@ -573,6 +924,10 @@ class OmicsTools:
         original_batch_key: str = "batch",
         is_count_data: bool = True,
         modality: str = "RNA",
+        recipe: Optional[dict] = None,
+        profile: Optional[dict] = None,
+        protocol: Optional[dict] = None,
+        primary_source: Optional[dict] = None,
     ) -> tuple[sc.AnnData, sc.AnnData]:
         """
         加载数据并执行基本预处理 (QC, HVG, PCA, UMAP)。
@@ -584,19 +939,33 @@ class OmicsTools:
 
         adata = sc.read(data_path)
 
-        # 批次键标准化：若缺失则视为配置错误
+        # 批次键标准化：若缺失则自动创建单批次
         if original_batch_key in adata.obs:
             adata.obs["batch"] = adata.obs[original_batch_key].astype("category")
         else:
-            raise KeyError(f"Batch key '{original_batch_key}' not found in adata.obs")
+            adata.obs["batch"] = "batch0"
 
         # 预处理分支（未来可扩展）
         modality_upper = (modality or "RNA").upper()
+        chosen_protocol = protocol or recipe
         if modality_upper in ["RNA", "ATAC", "ADT"]:
-            # TODO: 为 ATAC / ADT 替换为各自专用预处理流程
-            preprocessor = DataPreprocessor(adata=adata, is_count_data=is_count_data)
+            preprocessor = DataPreprocessor(
+                adata=adata,
+                is_count_data=is_count_data,
+                recipe=chosen_protocol,
+                profile=profile,
+                protocol=chosen_protocol,
+                primary_source=primary_source,
+            )
         else:
-            preprocessor = DataPreprocessor(adata=adata, is_count_data=is_count_data)
+            preprocessor = DataPreprocessor(
+                adata=adata,
+                is_count_data=is_count_data,
+                recipe=chosen_protocol,
+                profile=profile,
+                protocol=chosen_protocol,
+                primary_source=primary_source,
+            )
 
         return preprocessor.preprocess()
         
@@ -611,6 +980,7 @@ class OmicsTools:
         model_save_path = kwargs.get('model_save_path')
         early_stopping = kwargs.get('early_stopping', False)
         early_stopping_patience = kwargs.get('early_stopping_patience', 20)
+        layer = kwargs.get('layer')
 
         integrator = ScVIIntegration(
             adata_hvg=adata_hvg,
@@ -624,6 +994,7 @@ class OmicsTools:
             n_layers=n_layers,
             early_stopping=early_stopping,
             early_stopping_patience=early_stopping_patience,
+            layer=layer,
         )
         return integrator.integrate()
 
