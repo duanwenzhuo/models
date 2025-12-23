@@ -613,7 +613,12 @@ class InspectionAgent(BaseAgent):
             modality_name = info.get("modality") or "unknown"
 
             obs_columns = info.get("obs_columns", [])
-            batch_candidates = info.get("batch_candidates") or []
+            candidate_entries = info.get("batch_candidates") or []
+            batch_candidates = [
+                c.get("name") if isinstance(c, dict) else str(c)
+                for c in candidate_entries
+                if c is not None
+            ]
             user_intent = state.get("user_intent", "")
 
             warnings = []
@@ -621,7 +626,7 @@ class InspectionAgent(BaseAgent):
             if not batch_candidates:
                 adata.obs["batch"] = "batch0"
                 batch_candidates = ["batch"]
-                info["batch_candidates"] = [
+                candidate_entries = [
                     {
                         "name": "batch",
                         "score": 0.0,
@@ -630,6 +635,7 @@ class InspectionAgent(BaseAgent):
                         "top_levels": {"batch0": adata.n_obs},
                     }
                 ]
+                info["batch_candidates"] = candidate_entries
                 warnings.append(
                     "No batch-like column detected; created a single-batch placeholder 'batch'. Batch effect metrics may be uninformative."
                 )
