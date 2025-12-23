@@ -1118,6 +1118,8 @@ class PlannerAgent(BaseAgent):
                 )
             subplan["batch_key"] = effective_batch
 
+            view_guess = (ins.get("input_view") or "unknown").lower()
+
             # Assign a sanitized integration filename to avoid path issues
             try:
                 raw_filename = f"integrated_{modality}_{effective_batch}.h5ad"

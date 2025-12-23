@@ -751,11 +751,11 @@ class DataPreprocessor:
 class ScVIIntegration:
     """scVI ????"""
     # ?????????????????
-    def __init__(self, adata_hvg: sc.AnnData, adata_raw_full: sc.AnnData, batch_key: str, 
-                 is_count_data: bool = True, model_save_path: Optional[str] = None, 
+    def __init__(self, adata_hvg: sc.AnnData, adata_raw_full: sc.AnnData, batch_key: str,
+                 is_count_data: bool = True, model_save_path: Optional[str] = None,
                  n_latent: int = 20, max_epochs: int = 50, batch_size: Optional[int] = None,
                  n_layers: Optional[int] = None, early_stopping: bool = False,
-                 early_stopping_patience: int = 20):
+                 early_stopping_patience: int = 20, layer: Optional[str] = None):
         self.adata_hvg = adata_hvg
         self.adata_raw_full = adata_raw_full
         self.batch_key = batch_key
@@ -767,15 +767,16 @@ class ScVIIntegration:
         self.n_layers = n_layers
         self.early_stopping = early_stopping
         self.early_stopping_patience = early_stopping_patience
+        self.layer = layer
 
     def integrate(self) -> sc.AnnData:
         """?? scVI ??"""
         # ?? raw data ? hvg ??? cell ? gene ????
         adata_raw = self.adata_raw_full[self.adata_hvg.obs_names, self.adata_hvg.var_names].copy()
         adata_raw.obs[self.batch_key] = self.adata_hvg.obs[self.batch_key].copy()
-        
-        layer_name = "counts" if self.is_count_data else "activity"
-        adata_raw.layers[layer_name] = adata_raw.X.copy() 
+
+        layer_name = self.layer or ("counts" if self.is_count_data else "activity")
+        adata_raw.layers[layer_name] = adata_raw.X.copy()
 
         scvi.model.SCVI.setup_anndata(adata_raw, layer=layer_name, batch_key=self.batch_key)
         
@@ -979,6 +980,7 @@ class OmicsTools:
         model_save_path = kwargs.get('model_save_path')
         early_stopping = kwargs.get('early_stopping', False)
         early_stopping_patience = kwargs.get('early_stopping_patience', 20)
+        layer = kwargs.get('layer')
 
         integrator = ScVIIntegration(
             adata_hvg=adata_hvg,
@@ -992,6 +994,7 @@ class OmicsTools:
             n_layers=n_layers,
             early_stopping=early_stopping,
             early_stopping_patience=early_stopping_patience,
+            layer=layer,
         )
         return integrator.integrate()
 
