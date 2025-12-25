@@ -25,6 +25,7 @@ from tools import (
     compute_metric_raw,
     DetailedProfiler,
 )
+from integration_skills import INTEGRATION_SKILLS
 from openai import OpenAI
 
 # 配置日志
@@ -1130,16 +1131,6 @@ class PlannerAgent(BaseAgent):
             except Exception:
                 subplan["sanitized_filename"] = None
 
-            # Adjust method compatibility based on view
-            view_guess = (ins.get("input_view") or "unknown").lower()
-            if view_guess != "counts" and "scvi" in subplan.get("methods", {}):
-                subplan.setdefault("warnings", []).append(
-                    "scVI skipped because input does not look like raw counts"
-                )
-                subplan["methods"].pop("scvi", None)
-                if not subplan.get("methods"):
-                    subplan["methods"] = {"harmony": {}}
-
             protocol = preprocess_protocols.get(modality) or self._build_default_protocol(view_guess)
             preprocess_protocols[modality] = protocol
 
@@ -1519,6 +1510,7 @@ class IntegrationAgent(BaseAgent):
         state.setdefault("best_rank", {})
         state.setdefault("method_errors", {})
         state.setdefault("final_selection", {})
+        state.setdefault("method_run_log", [])
 
         adata_hvg_all = state.get("data_hvg") or {}
         adata_raw_all = state.get("data_raw") or {}
@@ -1547,7 +1539,7 @@ class IntegrationAgent(BaseAgent):
             if subplan.get("methods"):
                 methods_cfg = self._extract_methods_config(subplan["methods"])
             elif run_all_methods_flag:
-                methods_cfg = {name: {} for name in INTEGRATION_METHODS.keys()}
+                methods_cfg = {name: {} for name in INTEGRATION_SKILLS.keys()}
                 logger.info(f"[Integrator] run_all_methods=True, using all methods for {modality}: {list(methods_cfg.keys())}")
             else:
                 methods_cfg = self._extract_methods_config(subplan.get("methods", {}))
@@ -1557,8 +1549,50 @@ class IntegrationAgent(BaseAgent):
 
             for method_name, method_params in methods_cfg.items():
                 runner = INTEGRATION_METHODS.get(method_name)
-                if runner is None:
+                skill = INTEGRATION_SKILLS.get(method_name)
+                if runner is None or skill is None:
                     state["method_errors"][modality][method_name] = "Unknown integration method"
+                    continue
+
+                can_run, reason = skill.can_run(
+                    state=state,
+                    modality=modality,
+                    adata_hvg=adata_hvg_bm,
+                    adata_raw=adata_raw_bm,
+                    scope="benchmark",
+                )
+                if not can_run:
+                    state["method_errors"][modality][method_name] = reason or "Method is not runnable"
+                    state["method_run_log"].append(
+                        {
+                            "modality": modality,
+                            "method": method_name,
+                            "scope": "benchmark",
+                            "status": "skipped",
+                            "reason": reason,
+                        }
+                    )
+                    continue
+
+                adata_hvg_prepared, adata_raw_prepared, prepared_params, prep_error = skill.prepare_inputs(
+                    state=state,
+                    modality=modality,
+                    adata_hvg=adata_hvg_bm,
+                    adata_raw=adata_raw_bm,
+                    scope="benchmark",
+                    base_params=method_params,
+                )
+                if prep_error:
+                    state["method_errors"][modality][method_name] = prep_error
+                    state["method_run_log"].append(
+                        {
+                            "modality": modality,
+                            "method": method_name,
+                            "scope": "benchmark",
+                            "status": "failed",
+                            "reason": prep_error,
+                        }
+                    )
                     continue
 
                 presets = state.get("param_presets", {}).get(method_name, {}) or {}
@@ -1581,11 +1615,12 @@ class IntegrationAgent(BaseAgent):
                         "error": None,
                     }
                     try:
+                        merged_params = {**(params or {}), **(prepared_params or {})}
                         result_adata = runner(
-                            adata_hvg_bm,
-                            adata_raw_bm,
+                            adata_hvg_prepared,
+                            adata_raw_prepared,
                             batch_key=batch_key,
-                            **(params or {})
+                            **merged_params
                         )
                     except Exception as e:
                         record["error"] = str(e)
@@ -1631,8 +1666,26 @@ class IntegrationAgent(BaseAgent):
                     state["best_params"][modality][method_name] = best_params_for_method
                     state["best_param_tiers"][modality][method_name] = best_tier_name
                     state["best_rank"][modality].append((method_name, best_score if best_score is not None else 0.0))
+                    state["method_run_log"].append(
+                        {
+                            "modality": modality,
+                            "method": method_name,
+                            "scope": "benchmark",
+                            "status": "ran",
+                            "reason": None,
+                        }
+                    )
                 else:
                     state["method_errors"][modality][method_name] = "No valid params in benchmark"
+                    state["method_run_log"].append(
+                        {
+                            "modality": modality,
+                            "method": method_name,
+                            "scope": "benchmark",
+                            "status": "failed",
+                            "reason": "No valid params in benchmark",
+                        }
+                    )
 
             ranked = sorted(state["best_rank"].get(modality, []), key=lambda x: x[1], reverse=True)
             if not ranked:
@@ -1641,32 +1694,110 @@ class IntegrationAgent(BaseAgent):
             top_methods = ranked[:1] if top1_only else ranked
             for top_method, top_score in top_methods:
                 runner = INTEGRATION_METHODS.get(top_method)
-                if runner is None:
+                skill = INTEGRATION_SKILLS.get(top_method)
+                if runner is None or skill is None:
                     state["method_errors"][modality][top_method] = "Unknown integration method"
                     continue
                 params = state["best_params"][modality].get(top_method, {})
+                can_run, reason = skill.can_run(
+                    state=state,
+                    modality=modality,
+                    adata_hvg=adata_hvg_full,
+                    adata_raw=adata_raw_full,
+                    scope="full",
+                )
+                if not can_run:
+                    state["method_errors"][modality][top_method] = reason or "Method is not runnable on full data"
+                    state["method_run_log"].append(
+                        {
+                            "modality": modality,
+                            "method": top_method,
+                            "scope": "full",
+                            "status": "skipped",
+                            "reason": reason,
+                        }
+                    )
+                    continue
+
+                adata_hvg_prepared, adata_raw_prepared, prepared_params, prep_error = skill.prepare_inputs(
+                    state=state,
+                    modality=modality,
+                    adata_hvg=adata_hvg_full,
+                    adata_raw=adata_raw_full,
+                    scope="full",
+                    base_params=params,
+                )
+                if prep_error:
+                    state["method_errors"][modality][top_method] = prep_error
+                    state["method_run_log"].append(
+                        {
+                            "modality": modality,
+                            "method": top_method,
+                            "scope": "full",
+                            "status": "failed",
+                            "reason": prep_error,
+                        }
+                    )
+                    continue
                 try:
+                    merged_params = {**(params or {}), **(prepared_params or {})}
                     result_adata = runner(
-                        adata_hvg_full,
-                        adata_raw_full,
+                        adata_hvg_prepared,
+                        adata_raw_prepared,
                         batch_key=batch_key,
-                        **(params or {})
+                        **merged_params
                     )
                 except Exception as e:
                     state["method_errors"][modality][top_method] = str(e)
+                    state["method_run_log"].append(
+                        {
+                            "modality": modality,
+                            "method": top_method,
+                            "scope": "full",
+                            "status": "failed",
+                            "reason": str(e),
+                        }
+                    )
                     continue
 
                 if result_adata is None:
                     state["method_errors"][modality][top_method] = "Returned None on full data"
+                    state["method_run_log"].append(
+                        {
+                            "modality": modality,
+                            "method": top_method,
+                            "scope": "full",
+                            "status": "failed",
+                            "reason": "Returned None on full data",
+                        }
+                    )
                     continue
 
                 embedding_key = f"X_{top_method}"
                 if embedding_key not in result_adata.obsm:
                     state["method_errors"][modality][top_method] = f"Missing embedding {embedding_key} on full data"
+                    state["method_run_log"].append(
+                        {
+                            "modality": modality,
+                            "method": top_method,
+                            "scope": "full",
+                            "status": "failed",
+                            "reason": f"Missing embedding {embedding_key} on full data",
+                        }
+                    )
                     continue
 
                 state["results"][modality][top_method] = result_adata
                 state["final_selection"][modality] = {"method": top_method, "params": params, "score": top_score}
+                state["method_run_log"].append(
+                    {
+                        "modality": modality,
+                        "method": top_method,
+                        "scope": "full",
+                        "status": "ran",
+                        "reason": None,
+                    }
+                )
 
                 if top1_only:
                     break
