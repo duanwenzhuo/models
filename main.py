@@ -64,14 +64,14 @@ def main():
         "top1_only": not args.allow_multi_top,
         "data_hvg_full": {},
         "data_raw_full": {},
+        "views": {},
+        "view_meta": {},
+        "view_build_log": [],
         "logs": [],
         "error": None,
         "subset_config": subset_config,
         "task_modalities": [],
         "preprocess_recommendations": {},
-        "views": {},
-        "view_meta": {},
-        "view_build_log": [],
         "method_run_log": [],
     }
 
