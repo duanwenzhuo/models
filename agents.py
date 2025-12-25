@@ -893,9 +893,22 @@ class PlannerAgent(BaseAgent):
 
             # Adjust method compatibility based on view
             view_guess = (ins.get("input_view") or "unknown").lower()
-            if view_guess != "counts" and "scvi" in subplan.get("methods", {}):
+            profile = ins.get("profile") or {}
+            primary_source = ins.get("primary_source") or profile.get("primary_source") or {}
+            primary_layer = primary_source.get("use_layer")
+            layer_profiles = profile.get("layers") or profile.get("candidate_expression_layers") or {}
+            counts_layers_available = any(
+                stats.get("view_guess") == "counts" for stats in layer_profiles.values() if isinstance(stats, dict)
+            )
+            primary_is_counts = False
+            if primary_layer and primary_layer != "X":
+                primary_stats = layer_profiles.get(primary_layer) or {}
+                primary_is_counts = primary_stats.get("view_guess") == "counts"
+            counts_available = view_guess == "counts" or primary_is_counts or counts_layers_available
+
+            if not counts_available and "scvi" in subplan.get("methods", {}):
                 subplan.setdefault("warnings", []).append(
-                    "scVI skipped because input does not look like raw counts"
+                    "scVI skipped because counts-like inputs were not detected in X or layers"
                 )
                 subplan["methods"].pop("scvi", None)
                 if not subplan.get("methods"):
