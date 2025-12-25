@@ -22,9 +22,8 @@ def main():
     parser.add_argument("--allow-multi-top", action="store_true", help="Keep all tuned methods instead of top1")
     args = parser.parse_args()
 
-    # Resolve data_path:
-    # Priority: --data-path > --dataset > (error)
-    data_path = args.data_path.strip().strip('"').strip("'")
+
+    data_path = args.data_path.strip().strip("'")
     dataset = args.dataset.strip()
 
     if not data_path:
