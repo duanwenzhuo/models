@@ -38,6 +38,9 @@ class AgentState(TypedDict):
     data_raw: Optional[Any]
     data_hvg_full: Optional[Any]
     data_raw_full: Optional[Any]
+    views: Optional[Dict[str, Dict[str, Any]]]
+    view_meta: Optional[Dict[str, Dict[str, Any]]]
+    view_build_log: Optional[List[Dict[str, Any]]]
 
     # 最终结果
     results: Dict[str, Any]
@@ -58,6 +61,7 @@ class AgentState(TypedDict):
     best_param_tiers: Optional[Dict[str, Any]]
     best_rank: Optional[Dict[str, Any]]
     method_errors: Optional[Dict[str, Any]]
+    method_run_log: Optional[List[Dict[str, Any]]]
     final_selection: Optional[Dict[str, Any]]
     top1_only: bool
     search_params: bool
