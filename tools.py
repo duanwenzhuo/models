@@ -682,13 +682,13 @@ class DataPreprocessor:
 
     def _apply_recipe(self) -> tuple[sc.AnnData, sc.AnnData]:
         adata = self.adata.copy()
-        raw_adata_storage = adata.copy()
 
         chosen_layer = None
         primary_layer = self.primary_source.get("use_layer") or self.protocol.get("primary_layer")
         if primary_layer and primary_layer in adata.layers:
             adata.X = adata.layers[primary_layer].copy()
             chosen_layer = primary_layer
+        raw_adata_storage = adata.copy()
 
         hv_mask = None
         skip_if_present = set(self.protocol.get("skip_if_present") or [])
