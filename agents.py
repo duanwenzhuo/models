@@ -28,9 +28,7 @@ from tools import (
 from integration_skills import INTEGRATION_SKILLS
 from openai import OpenAI
 
-# 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(f"{config.LOGGER_NAME}.{__name__}")
 
 
 def build_openai_client() -> OpenAI:

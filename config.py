@@ -108,29 +108,69 @@ COMPUTE_BUDGET: Dict[str, Any] = {
 
 def configure_logging(dataset_name: str) -> str:
     """
-    Configure the global logger for the current run and return the log-path.
+    Quiet-by-default logging.
+
+    - Console: only ERROR (so normal runs stay silent)
+    - File: INFO (full trace for debugging)
+    - Captures Python warnings into the log file
     """
     os.makedirs(LOGS_DIR, exist_ok=True)
     log_path = os.path.join(LOGS_DIR, f"{dataset_name}.log")
 
-    logger = logging.getLogger(LOGGER_NAME)
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
+    # ---- Root logger (captures 3rd-party libs too) ----
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for h in list(root.handlers):
+        root.removeHandler(h)
 
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
     file_handler.setLevel(logging.INFO)
-    file_formatter = logging.Formatter(
+    file_handler.setFormatter(logging.Formatter(
         "%(asctime)s | %(name)s | %(levelname)s | %(message)s"
-    )
-    file_handler.setFormatter(file_formatter)
+    ))
 
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.WARNING)
-    console_formatter = logging.Formatter("%(levelname)s | %(message)s")
-    console_handler.setFormatter(console_formatter)
+    console_handler.setLevel(logging.ERROR)
+    console_handler.setFormatter(logging.Formatter("%(levelname)s | %(message)s"))
 
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+    root.addHandler(file_handler)
+    root.addHandler(console_handler)
+
+    # ---- Our project namespace ----
+    proj = logging.getLogger(LOGGER_NAME)
+    proj.setLevel(logging.INFO)
+    proj.propagate = True
+    proj.handlers.clear()
+
+    # ---- Quiet noisy libraries ----
+    noisy = [
+        "httpx",
+        "openai",
+        "harmonypy",
+        "umap",
+        "pynndescent",
+        "numba",
+        "scanpy",
+        "anndata",
+        "scvi",
+        "matplotlib",
+        "langgraph",
+    ]
+    for name in noisy:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+    # ---- Capture warnings into log file (no console spam) ----
+    logging.captureWarnings(True)
+    logging.getLogger("py.warnings").setLevel(logging.WARNING)
+
+    def _showwarning(message, category, filename, lineno, file=None, line=None):
+        logging.getLogger(f"{LOGGER_NAME}.warnings").warning(
+            "%s:%s: %s: %s", filename, lineno, category.__name__, message
+        )
+
+    import warnings as _warnings
+    _warnings.showwarning = _showwarning
+    _warnings.filterwarnings("default")
 
     return log_path
 

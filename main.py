@@ -1,18 +1,20 @@
 # main.py
 import argparse
+import contextlib
 import os
+
 import config
 from tools import slugify_dataset_name
-from workflow import create_workflow_app
 
 
 def main():
     parser = argparse.ArgumentParser(description="LLM-based Multi-Agent Omics Integration")
     parser.add_argument("--dataset", default="", help="Dataset folder name under DATA_DIR (e.g. Lung_atlas_public)")
     parser.add_argument("--data-path", default="", help="Explicit path to .h5ad (overrides --dataset)")
-    parser.add_argument("--task", default=(
-        "Load the data and perform integration while automatically detecting the batch column."
-    ))
+    parser.add_argument(
+        "--task",
+        default="Load the data and perform integration while automatically detecting the batch column.",
+    )
     parser.add_argument("--subset-genes", help="Comma separated gene list", default="")
     parser.add_argument("--subset-celltypes", help="Comma separated cell type list", default="")
     parser.add_argument("--subset-batches", help="Comma separated batch ids", default="")
@@ -22,7 +24,6 @@ def main():
     parser.add_argument("--allow-multi-top", action="store_true", help="Keep all tuned methods instead of top1")
     args = parser.parse_args()
 
-
     data_path = args.data_path.strip().strip("'")
     dataset = args.dataset.strip()
 
@@ -31,19 +32,9 @@ def main():
             raise ValueError("You must provide either --data-path or --dataset")
         data_path = os.path.join(config.DATA_DIR, dataset, f"{dataset}.h5ad")
 
-    # Normalize to absolute path for clarity/logging
     data_path = os.path.abspath(data_path)
-
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Data file not found: {data_path}")
-
-    print("==================================================")
-    print("LLM-based Multi-Agent Omics Integration System")
-    print("==================================================")
-    print(f"Data Directory: {config.DATA_DIR}")
-    print(f"Model: {config.LLM_MODEL}")
-    print(f"User task: {args.task}")
-    print(f"Data Path: {data_path}")
 
     subset_config = {
         "genes": [g.strip().upper() for g in args.subset_genes.split(",") if g.strip()],
@@ -53,9 +44,10 @@ def main():
 
     dataset_slug = slugify_dataset_name(data_path)
     log_path = config.configure_logging(dataset_slug)
-    print(f"Log file: {log_path}")
 
-    # 1. Prepare initial input
+    # Late import to avoid any module-level logging config from polluting console output.
+    from workflow import create_workflow_app
+
     initial_state = {
         "user_intent": args.task,
         "data_path": data_path,
@@ -83,54 +75,60 @@ def main():
         "method_run_log": [],
     }
 
-    # 2. Create and run workflow
+    stdout_path = os.path.splitext(log_path)[0] + ".stdout.log"
+
     try:
         app = create_workflow_app()
 
-        print("\n--- Starting Workflow Execution ---\n")
-        final_state = app.invoke(initial_state)
+        # Hard guarantee: absolutely no library print spam on console.
+        with open(stdout_path, "a", encoding="utf-8") as _out, \
+                contextlib.redirect_stdout(_out), contextlib.redirect_stderr(_out):
+            final_state = app.invoke(initial_state)
 
-        # 3. Handle results
         if final_state.get("error"):
-            print(f"\nWorkflow terminated with error: {final_state['error']}")
+            print(f"✗ Workflow error: {final_state['error']}")
+            print(f"Log: {log_path}")
+            print(f"Stdout/Stderr: {stdout_path}")
             return
 
-        print("\n================ FINAL REPORT ================")
-        print(f"Execution Logs: {final_state.get('logs')}")
-
-        evaluation_df = final_state.get("evaluation")
-        if evaluation_df is not None:
-            try:
-                print("\nEvaluation (head):")
-                print(evaluation_df.head())
-            except Exception:
-                print("\nEvaluation available.")
-
-        results = final_state.get("results", {})
+        results = final_state.get("results") or {}
         if not results:
-            print("No integration results found.")
+            print("✗ No integration results produced.")
+            print(f"Log: {log_path}")
+            print(f"Stdout/Stderr: {stdout_path}")
             return
 
+        saved_paths = []
         for modality, modality_results in results.items():
-            if not modality_results:
-                print(f"No results for modality {modality}")
-                continue
-            for method, adata in modality_results.items():
-                print(f"Success: [{modality}] - [{method}]")
-                print(f"   Shape: {adata.shape}")
-                embedding_keys = list(adata.obsm.keys())
-                if embedding_keys:
-                    print(f"   Embedding keys: {embedding_keys}")
-
+            for method, adata in (modality_results or {}).items():
                 out_name = f"integrated_{modality}_{method}.h5ad"
                 out_path = os.path.join(config.RESULTS_DIR, out_name)
                 adata.write(out_path)
-                print(f"   Saved to: {out_path}")
+                saved_paths.append(out_path)
+
+        final_sel = final_state.get("final_selection") or {}
+        if final_sel:
+            for modality, info in final_sel.items():
+                score = info.get("score")
+                score_str = f"{score:.4f}" if isinstance(score, (int, float)) else str(score)
+                print(f"✓ {modality}: best={info.get('method')} score={score_str}")
+        else:
+            print("✓ Integration finished.")
+
+        if saved_paths:
+            print(f"Outputs ({len(saved_paths)}):")
+            for p in saved_paths:
+                print(f"  - {p}")
+
+        print(f"Log: {log_path}")
+        print(f"Stdout/Stderr: {stdout_path}")
 
     except Exception as e:
-        print(f"\nCritical System Error: {e}")
+        print(f"Critical System Error: {e}")
         import traceback
         traceback.print_exc()
+        print(f"Log: {log_path}")
+        print(f"Stdout/Stderr: {stdout_path}")
 
 
 if __name__ == "__main__":
