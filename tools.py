@@ -10,7 +10,7 @@ import gc
 import anndata
 import scipy.sparse as sp
 import re
-from typing import Optional, Dict, Any, Union, Callable
+from typing import Optional, Dict, Any, Union, Callable, Iterable
 import harmonypy as hm
 import subprocess
 import config
@@ -351,6 +351,7 @@ R_LIGER_SEURAT_SCRIPT_TEMPLATE = r"""
 suppressPackageStartupMessages({
   library(Seurat)
   library(rliger)
+  library(Matrix)
 })
 
 DATA_INPUT_DIR <- "__DATA_DIR__"
@@ -367,7 +368,9 @@ CCA_K_FILTER <- __CCA_K_FILTER__
 LIGER_K <- __LIGER_K__
 LIGER_LAMBDA <- __LIGER_LAMBDA__
 
-COUNT_MATRIX_FILE <- file.path(DATA_INPUT_DIR, paste0(BASE_NAME, ".csv"))
+COUNT_MATRIX_FILE <- file.path(DATA_INPUT_DIR, paste0(BASE_NAME, ".mtx"))
+GENE_FILE <- file.path(DATA_INPUT_DIR, paste0(BASE_NAME, ".genes.txt"))
+CELL_FILE <- file.path(DATA_INPUT_DIR, paste0(BASE_NAME, ".cells.txt"))
 METADATA_FILE <- file.path(DATA_INPUT_DIR, paste0(BASE_NAME, "_metadata.csv"))
 
 message(sprintf("项目: %s", PROJECT_NAME))
@@ -377,7 +380,20 @@ message(sprintf("Counts: %s", COUNT_MATRIX_FILE))
 message(sprintf("Metadata: %s", METADATA_FILE))
 
 load_and_split_data <- function() {
-  counts_df <- read.csv(COUNT_MATRIX_FILE, row.names = 1, check.names = FALSE, stringsAsFactors = FALSE)
+  counts_matrix <- readMM(COUNT_MATRIX_FILE)
+  counts_matrix <- as(counts_matrix, "dgCMatrix")
+  genes <- readLines(GENE_FILE, warn = FALSE)
+  cells <- readLines(CELL_FILE, warn = FALSE)
+
+  if (length(genes) != nrow(counts_matrix)) {
+    stop(sprintf("Gene list length (%d) != nrow(counts_matrix) (%d).", length(genes), nrow(counts_matrix)))
+  }
+  if (length(cells) != ncol(counts_matrix)) {
+    stop(sprintf("Cell list length (%d) != ncol(counts_matrix) (%d).", length(cells), ncol(counts_matrix)))
+  }
+  rownames(counts_matrix) <- genes
+  colnames(counts_matrix) <- cells
+
   metadata_df <- read.csv(METADATA_FILE, row.names = 1, check.names = FALSE, stringsAsFactors = FALSE)
   metadata_df$OriginalCellID <- rownames(metadata_df)
 
@@ -385,8 +401,8 @@ load_and_split_data <- function() {
     stop(sprintf("Metadata 缺少批次列 '%s'.", BATCH_KEY))
   }
 
-  clean_matrix_cols <- trimws(colnames(counts_df))
-  colnames(counts_df) <- clean_matrix_cols
+  clean_matrix_cols <- trimws(colnames(counts_matrix))
+  colnames(counts_matrix) <- clean_matrix_cols
 
   clean_meta_rows <- trimws(rownames(metadata_df))
   rownames(metadata_df) <- clean_meta_rows
@@ -396,8 +412,7 @@ load_and_split_data <- function() {
     stop("Counts 与 metadata 没有共同的细胞 ID.")
   }
 
-  counts_matrix <- as.matrix(counts_df[, common_cells, drop = FALSE])
-  storage.mode(counts_matrix) <- "double"
+  counts_matrix <- counts_matrix[, common_cells, drop = FALSE]
   metadata_df <- metadata_df[common_cells, , drop = FALSE]
   metadata_df[[BATCH_KEY]] <- as.factor(metadata_df[[BATCH_KEY]])
 
@@ -408,10 +423,11 @@ load_and_split_data <- function() {
   for (batch_name in batches) {
     batch_cells <- rownames(metadata_df)[metadata_df[[BATCH_KEY]] == batch_name]
     batch_counts <- counts_matrix[, batch_cells, drop = FALSE]
-    batch_counts <- as.matrix(batch_counts)
-    storage.mode(batch_counts) <- "double"
-    seurat_obj <- CreateSeuratObject(counts = batch_counts, project = as.character(batch_name),
-                                     meta.data = metadata_df[batch_cells, , drop = FALSE])
+    seurat_obj <- CreateSeuratObject(
+      counts = batch_counts,
+      project = as.character(batch_name),
+      meta.data = metadata_df[batch_cells, , drop = FALSE]
+    )
     seurat_object_list[[as.character(batch_name)]] <- seurat_obj
     liger_raw_data_list[[as.character(batch_name)]] <- batch_counts
   }
@@ -1029,32 +1045,125 @@ class OmicsTools:
         base_name: str,
         output_dir: str,
     ) -> tuple[str, str]:
+        """
+        Export data for external R integration without densifying the matrix.
+
+        Writes:
+          - <base_name>.mtx        (MatrixMarket sparse; genes x cells)
+          - <base_name>.genes.txt  (one gene/feature per line; matches matrix rows)
+          - <base_name>.cells.txt  (one cell per line; matches matrix cols)
+          - <base_name>_metadata.csv (cell metadata; indexed by Cell_ID)
+
+        Returns:
+          (counts_mtx_path, meta_csv_path)
+        """
+        import hashlib
+        import json
+        from scipy.sparse import csr_matrix
+
         os.makedirs(output_dir, exist_ok=True)
+
         adata_source = adata_raw if adata_raw is not None else adata_hvg
         common_cells = adata_hvg.obs_names.intersection(adata_source.obs_names)
         if len(common_cells) == 0:
             raise ValueError("No overlapping cells between HVG and source AnnData for R export.")
         adata_source = adata_source[common_cells].copy()
         adata_hvg_aligned = adata_hvg[common_cells].copy()
+
         X = adata_source.X
         if sp.issparse(X):
-            X = X.toarray()
-        counts_df = pd.DataFrame(
-            X.T,
-            index=adata_source.var_names,
-            columns=adata_source.obs_names,
-        )
-        counts_path = os.path.join(output_dir, f"{base_name}.csv")
-        counts_df.to_csv(counts_path)
+            X_gene_cell = X.T.tocsr()
+        else:
+            X_gene_cell = csr_matrix(X.T)
+
+        counts_path = os.path.join(output_dir, f"{base_name}.mtx")
+        genes_path = os.path.join(output_dir, f"{base_name}.genes.txt")
+        cells_path = os.path.join(output_dir, f"{base_name}.cells.txt")
+        meta_path = os.path.join(output_dir, f"{base_name}_metadata.csv")
+        stamp_path = os.path.join(output_dir, f"{base_name}.stamp.json")
+
+        def _quick_fingerprint(names: Iterable[str], k: int = 200) -> str:
+            names = list(map(str, names))
+            head = names[:k]
+            tail = names[-k:] if len(names) > k else []
+            hasher = hashlib.md5()
+            for item in head + tail:
+                hasher.update(item.encode("utf-8", errors="ignore"))
+                hasher.update(b"\n")
+            return hasher.hexdigest()
+
+        stamp = {
+            "n_cells": int(adata_source.n_obs),
+            "n_features": int(adata_source.n_vars),
+            "cells_fp": _quick_fingerprint(adata_source.obs_names),
+            "genes_fp": _quick_fingerprint(adata_source.var_names),
+            "batch_key": str(batch_key),
+        }
+
+        if all(
+            os.path.exists(path) and os.path.getsize(path) > 0
+            for path in (counts_path, genes_path, cells_path, meta_path, stamp_path)
+        ):
+            try:
+                with open(stamp_path, "r", encoding="utf-8") as handle:
+                    old_stamp = json.load(handle)
+                if old_stamp == stamp:
+                    logger.debug(f"[R Export] Reusing cached sparse export: {counts_path}")
+                    return counts_path, meta_path
+            except Exception:
+                pass
+
+        n_rows, n_cols = X_gene_cell.shape
+        nnz = int(X_gene_cell.nnz)
+
+        with open(counts_path, "w", encoding="utf-8") as handle:
+            handle.write("%%MatrixMarket matrix coordinate real general\n")
+            handle.write("% generated by OmicsTools.export_adata_for_r (sparse, streamed)\n")
+            handle.write(f"{n_rows} {n_cols} {nnz}\n")
+            indptr = X_gene_cell.indptr
+            indices = X_gene_cell.indices
+            data = X_gene_cell.data
+            for row_idx in range(n_rows):
+                start = indptr[row_idx]
+                stop = indptr[row_idx + 1]
+                if start == stop:
+                    continue
+                row_1 = row_idx + 1
+                cols = indices[start:stop]
+                vals = data[start:stop]
+                for col_idx, value in zip(cols, vals):
+                    handle.write(f"{row_1} {int(col_idx) + 1} {float(value)}\n")
+
+        with open(genes_path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(map(str, adata_source.var_names)))
+            handle.write("\n")
+        with open(cells_path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(map(str, adata_source.obs_names)))
+            handle.write("\n")
 
         meta = adata_hvg_aligned.obs.copy()
         if batch_key not in meta.columns:
             raise KeyError(f"Batch key '{batch_key}' not found in metadata for R export.")
         meta.index.name = "Cell_ID"
-        meta_path = os.path.join(output_dir, f"{base_name}_metadata.csv")
         meta.to_csv(meta_path)
 
-        logger.info(f"[R Export] Counts saved to {counts_path}, metadata saved to {meta_path}")
+        try:
+            with open(stamp_path, "w", encoding="utf-8") as handle:
+                json.dump(stamp, handle)
+        except Exception:
+            pass
+
+        logger.info(
+            "[R Export] Sparse matrix saved to %s (genes=%d, cells=%d, nnz=%d); "
+            "genes to %s, cells to %s; metadata to %s",
+            counts_path,
+            n_rows,
+            n_cols,
+            nnz,
+            genes_path,
+            cells_path,
+            meta_path,
+        )
         return counts_path, meta_path
 
     @staticmethod
@@ -1116,9 +1225,9 @@ class OmicsTools:
                 logger.error(f"Rscript failed with code {result.returncode}, stderr is empty.")
             raise RuntimeError(f"External R integration failed for {method_name}.")
         if stdout_text:
-            logger.info(f"Rscript stdout:\n{stdout_text}")
+            logger.debug(f"Rscript stdout:\n{stdout_text}")
         else:
-            logger.info("Rscript stdout is empty.")
+            logger.debug("Rscript stdout is empty.")
 
         if method_lower == "liger":
             csv_path = os.path.join(output_dir, f"{base_name}_liger_umap_and_clusters.csv")
