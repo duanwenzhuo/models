@@ -42,12 +42,21 @@ class IntegrationSkill:
             fingerprint = (meta or {}).get("fingerprint") or {}
             integer_fraction = fingerprint.get("integer_fraction")
             neg_rate = fingerprint.get("neg_rate")
+            view_guess = fingerprint.get("view_guess")
+            source_label = (meta or {}).get("source")
             if adata_raw is None:
                 return False, "Raw counts AnnData is missing"
             if integer_fraction is None or neg_rate is None:
                 return False, "Unable to validate raw counts fingerprint"
             if integer_fraction <= 0.85 or neg_rate >= 0.01:
-                return False, "Raw counts fingerprint does not meet scVI requirements"
+                return (
+                    False,
+                    (
+                        "Raw counts fingerprint does not meet scVI requirements "
+                        f"(source={source_label}, view_guess={view_guess}, "
+                        f"integer_fraction={integer_fraction}, neg_rate={neg_rate})"
+                    ),
+                )
 
         return True, None
 

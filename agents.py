@@ -2043,6 +2043,37 @@ class ReporterAgent(BaseAgent):
             print(f"Subset preferences: {subset_cfg}")
 
     @staticmethod
+    def _print_view_summary(state: Dict[str, Any]) -> None:
+        view_meta = state.get("view_meta") or {}
+        view_log = state.get("view_build_log") or []
+
+        if not view_meta and not view_log:
+            return
+
+        print("\n--- View Build Summary ---")
+        for scope, scope_meta in view_meta.items():
+            print(f"[scope={scope}]")
+            for modality, views in (scope_meta or {}).items():
+                for view_name, meta in (views or {}).items():
+                    source = meta.get("source")
+                    n_obs = meta.get("n_obs")
+                    n_vars = meta.get("n_vars")
+                    view_guess = (meta.get("fingerprint") or {}).get("view_guess")
+                    print(
+                        f"  {modality}/{view_name}: source={source}, "
+                        f"n_obs={n_obs}, n_vars={n_vars}, view_guess={view_guess}"
+                    )
+
+        if view_log:
+            print("\n--- View Build Log ---")
+            for entry in view_log:
+                print(
+                    f"[{entry.get('scope')}] {entry.get('modality')}:{entry.get('view')} "
+                    f"status={entry.get('status')} cache={entry.get('cache_hit')} "
+                    f"reason={entry.get('reason')}"
+                )
+
+    @staticmethod
     def _print_results(results: Dict[str, Any]):
         print("\n--- Results Overview ---")
         if not results:
@@ -2128,6 +2159,7 @@ class ReporterAgent(BaseAgent):
             print(f"ERROR: {state.get('error')}")
         self._print_task_profile(state)
         self._print_plan(state.get("plan") or {})
+        self._print_view_summary(state)
         self._print_results(state.get("results") or {})
         self._print_final_selection(state.get("final_selection") or {})
         self._print_evaluation(state.get("evaluation"))
